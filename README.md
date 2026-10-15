@@ -47,7 +47,7 @@ On Windows, a timeout kills the judge command itself but not processes it starte
 # the others differ only in question and level order)
 python3 council.py show-request --brief examples/coordinator-host/brief.md --proposals examples/coordinator-host/*.md
 
-# judge with Claude through its CLI, 5 samples per proposal (the default)
+# judge with Claude through its CLI, 6 samples per proposal (the default)
 python3 council.py judge --judge-cmd claude --brief BRIEF.md --proposals a.md b.md c.md --out run.report.json
 
 # a panel: samples alternate between Claude and Codex, and their answers are pooled
@@ -70,7 +70,7 @@ python3 council.py rescore --report run.report.json --rubric my_rubric.json
 python3 council.py rescore --report run.report.json --rubric rubrics/system_design.json --mandatory 2 6
 
 # keep a decision journal, record what you would pick, and see how each gate does
-python3 council.py judge --brief BRIEF.md --proposals a.md b.md --out run.report.json --journal ~/council/decisions.jsonl
+python3 council.py judge --judge-cmd claude --brief BRIEF.md --proposals a.md b.md --out run.report.json --journal ~/council/decisions.jsonl
 python3 council.py label --journal ~/council/decisions.jsonl --brief BRIEF.md --pick b.md
 python3 council.py validate --journal ~/council/decisions.jsonl
 

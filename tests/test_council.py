@@ -1009,6 +1009,138 @@ class MandatoryPathTests(unittest.TestCase):
         self.assertEqual([d['id'] for d in r['dimensions'] if d['id'] != 'headroom'], [d['id'] for d in default['dimensions']])
 
 
+class MandatoryReviewTests(unittest.TestCase):
+    """Regressions from the blind Codex review of operative --mandatory: several constraints, clearing,
+    the journal writer, bounds, argument parsing, pure addition, and the opt-in headroom trade-off."""
+
+    def fixture(self, p1=0.95, p2=0.05):
+        rub = rubric()
+        row = {'label': 'Proposal A', 'source': 'a.md', 'proposal_sha256': c.sha256(b'proposal'),
+               'answers': answers({d['id']: 3 for d in rub['dimensions'] if 'levels' in d},
+                                  addressed={'constraint_fit.1': p1, 'constraint_fit.2': p2})}
+        return c.build_report(BRIEF.strip(), [row], rub, 'scripted', 0)
+
+    def test_review_multiple_checks_reach_both_gates(self):
+        plain = self.fixture()
+        for mandatory in ([1, 2], [2, 1]):
+            strict = c.rescore(plain, rubric(), mandatory)
+            for gate in ('decision', 'shadow'):
+                self.assertEqual(strict[gate]['action'], 'escalate')
+                self.assertIn('mandatory constraint 2 is open', ' '.join(strict[gate]['reasons']))
+        yes = c.rescore(self.fixture(0.95, 0.95), rubric(), [1, 2])
+        self.assertEqual([yes[g]['action'] for g in ('decision', 'shadow')], ['recommend', 'recommend'])
+
+    def test_review_clearing_changes_verdict_and_reasons_not_only_metadata(self):
+        strict = c.rescore(self.fixture(), rubric(), [2])
+        inherited = c.rescore(strict, rubric())
+        cleared = c.rescore(strict, rubric(), [])
+        self.assertEqual(inherited['mandatory_constraints'], [2])
+        self.assertEqual(cleared['mandatory_constraints'], [])
+        for gate in ('decision', 'shadow'):
+            self.assertEqual(strict[gate]['action'], 'escalate')
+            self.assertEqual(inherited[gate], strict[gate])
+            self.assertEqual(cleared[gate]['action'], 'recommend')
+            self.assertEqual(cleared[gate]['reasons'], [])
+
+    def test_review_real_journal_preserves_procedure_after_clearing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            saved, journal = folder / 'r.json', folder / 'j.jsonl'
+            brief, proposal = folder / 'brief.md', folder / 'a.md'
+            brief.write_text(BRIEF.strip())
+            proposal.write_text('proposal')
+            c.write_json(saved, c.rescore(self.fixture(), rubric(), [2]))
+            args = ['rescore', '--report', str(saved), '--rubric', str(c.DEFAULT_RUBRIC),
+                    '--out', str(saved), '--journal', str(journal)]
+            self.assertEqual(c.main(args, out=io.StringIO()), 1)
+            c.main(['label', '--journal', str(journal), '--brief', str(brief), '--pick', str(proposal)],
+                   out=io.StringIO())
+            self.assertEqual(c.main(args + ['--mandatory'], out=io.StringIO()), 0)
+            records = [json.loads(line) for line in journal.read_text().splitlines()]
+            runs = [r for r in records if r['kind'] == 'run']
+            self.assertEqual([r['mandatory_constraints'] for r in runs], [[2], []])
+            self.assertEqual([r['operative']['action'] for r in runs], ['escalate', 'recommend'])
+            self.assertIn('mandatory constraint 2', ' '.join(runs[0]['operative']['reasons']))
+            self.assertEqual(runs[1]['operative']['reasons'], [])
+            summary = c.validate(records)
+            self.assertIn('2 procedures', summary)
+            rows = [line.split()[1:5] for line in summary.splitlines() if line.startswith('operative')]
+            self.assertEqual(rows, [['1', '0', '0', '0%'], ['1', '1', '0', '100%']])
+
+    def test_review_zero_negative_and_out_of_range_are_errors(self):
+        for bad in (0, -1, 3):
+            with self.assertRaises(ValueError):
+                c.rescore(self.fixture(), rubric(), [bad])
+        self.assertEqual(c.check_mandatory([2, 1, 2], c.parse_constraints(BRIEF), rubric()), [1, 2])
+        with self.assertRaises(ValueError):
+            c.check_mandatory([1], c.parse_constraints(BRIEF), score_rubric())
+
+    def test_review_nargs_empty_absent_and_multiple(self):
+        prefix = ['rescore', '--report', 'report.json', '--rubric', 'rubric.json']
+        self.assertIsNone(c.parse_args(prefix)[1].mandatory)
+        self.assertEqual(c.parse_args(prefix + ['--mandatory'])[1].mandatory, [])
+        self.assertEqual(c.parse_args(prefix + ['--mandatory', '--out', 'out.json'])[1].mandatory, [])
+        self.assertEqual(c.parse_args(prefix + ['--mandatory', '2', '1'])[1].mandatory, [2, 1])
+        # Like other store options, repeating the flag replaces its earlier value.
+        self.assertEqual(c.parse_args(prefix + ['--mandatory', '1', '--mandatory', '2'])[1].mandatory, [2])
+
+    def test_review_pure_addition_with_runner_veto_error_and_no_survivors(self):
+        for p in (0.0, 0.25, 0.5, 0.74, 0.75, 0.95, 1.0):
+            for missing in (False, True):
+                plain = self.fixture(0.95, p)
+                lead = plain['judged'][0]
+                if missing:
+                    lead['answers']['constraint_fit.2']['confidence'] = None
+                runner = json.loads(json.dumps(lead))
+                runner.update(label='Proposal B', source='b.md')
+                for d in rubric()['dimensions']:
+                    if 'levels' in d:
+                        runner['answers'][d['id']] = score_answer(0, len(d['levels']) - 1)
+                vetoed = json.loads(json.dumps(lead))
+                vetoed.update(label='Proposal C', source='c.md')
+                vetoed['answers']['violates_hard_constraint']['noul'] = 1.0
+                failed = {'label': 'Proposal D', 'source': 'd.md', 'error': 'test error'}
+                judged = [lead, runner, vetoed, failed]
+                for advisory in (False, True):
+                    r = rubric()
+                    r['decision']['allow_missing_confidence'] = advisory
+                    before = c.build_report(BRIEF.strip(), judged, r, 'scripted', 0)
+                    after = c.build_report(BRIEF.strip(), judged, r, 'scripted', 0, mandatory=[1, 2])
+                    self.assertEqual(before['scored'], after['scored'])
+                    for gate in ('decision', 'shadow'):
+                        self.assertEqual(before[gate]['recommendation'], after[gate]['recommendation'])
+                        prior = before[gate]['reasons']
+                        self.assertEqual(after[gate]['reasons'][:len(prior)], prior)
+                        if before[gate]['action'] == 'escalate':
+                            self.assertEqual(after[gate]['action'], 'escalate')
+        for rows in ([failed], [vetoed]):
+            before = c.build_report(BRIEF.strip(), rows, rubric(), 'scripted', 0)
+            after = c.build_report(BRIEF.strip(), rows, rubric(), 'scripted', 0, mandatory=[1, 2])
+            for gate in ('decision', 'shadow'):
+                self.assertEqual(before[gate], after[gate])
+
+    def test_review_headroom_opt_in_and_documented_free_credit(self):
+        default = rubric()
+        head = c.load_rubric(ROOT / 'rubrics' / 'system_design_headroom.json')
+        without = dict(head, dimensions=[d for d in head['dimensions'] if d['id'] != 'headroom'])
+        self.assertEqual(c.build_questions(default, ['one']), c.build_questions(without, ['one']))
+        row = {'label': 'Proposal A', 'source': 'a.md', 'answers': {}}
+        for d in default['dimensions']:
+            row['answers'][d['id'] + ('.1' if 'per_constraint' in d else '')] = ({'noul': 0.2} if 'per_constraint' in d else
+                                      score_answer(0.2 * (len(d['levels']) - 1), len(d['levels']) - 1))
+        for v in default['vetoes']:
+            row['answers'][v['id']] = {'noul': 0.0}
+        brief = 'No growth.\n\nHard constraints:\n- One requirement.'
+        plain = c.build_report(brief, [row], default, 'scripted', 0)
+        row['answers']['headroom'] = score_answer(3, 3)
+        inflated = c.build_report(brief, [row], head, 'scripted', 0)
+        self.assertAlmostEqual(plain['scored'][0]['total'], 0.2)
+        self.assertAlmostEqual(inflated['scored'][0]['total'], 0.304)
+        self.assertEqual((plain['decision']['action'], inflated['decision']['action']), ('escalate', 'recommend'))
+        with self.assertRaisesRegex(ValueError, 'same questions'):
+            c.rescore(plain, head)
+
+
 class ShadowGateTests(unittest.TestCase):
     LIVE = EXAMPLE / 'live-run.jev-1.13.0.json'
 
