@@ -1258,11 +1258,13 @@ def parse_args(argv):
             p.add_argument('--ollama-url', default='http://localhost:11434')
             p.add_argument('--ollama-model', default='qwen2.5:7b')
         p.add_argument('--out', help='write the full JSON report here (judge: also after each proposal)')
-        p.add_argument('--mandatory', nargs='+', type=int, metavar='N', default=None,
+        p.add_argument('--mandatory', nargs='*', type=int, metavar='N', default=None,
                        help='hard constraints (numbered as printed) that must be met before adoption: the leader is '
-                            'recommended only if the judge confidently says it meets each one')
+                            'recommended only if the judge confidently says it meets each one. rescore keeps the '
+                            'recorded ones unless given; --mandatory with no numbers clears them')
         p.add_argument('--allow-missing-confidence', action='store_true',
-                       help='advisory run: recommend even when the judge reports no confidence (Ollama)')
+                       help='advisory run: recommend even when the judge reports no confidence (Ollama); never '
+                            'waives a --mandatory constraint')
         p.add_argument('--journal', help='append this run to a decision journal (needs --out)')
     p = sub.add_parser('label', help='record the proposal you would pick given what was known, for validate')
     p.add_argument('--journal', required=True)

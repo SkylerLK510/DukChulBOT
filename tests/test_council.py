@@ -951,6 +951,64 @@ class MandatoryTests(unittest.TestCase):
         self.assertEqual(strict['decision']['action'], 'escalate')
 
 
+class MandatoryPathTests(unittest.TestCase):
+    """--mandatory through the CLI judge path, its exact boundary, clearing it on rescore, and the opt-in rubric."""
+
+    def test_judge_with_mandatory_escalates_through_the_cli(self):
+        folder = Path(tempfile.mkdtemp())
+        report = folder / 'r.json'
+        args = ['judge', '--judge-cmd', 'fake', '--samples', '3', *CliTests.ARGS, '--out', str(report)]
+        checkpoint = 'Checkpoint files must end up'
+
+        def runner(self, argv, prompt):  # answers false on the checkpoint constraint, true elsewhere
+            reply = json.loads(fake_cli()(argv, prompt))
+            for key, kind, line in QUESTION.findall(prompt):
+                if kind == 'true or false' and checkpoint in line:
+                    reply[key] = False
+            return json.dumps(reply)
+
+        with mock.patch.object(c.CommandJudge, 'run_command', runner), mock.patch.object(c.sys, 'stderr', io.StringIO()):
+            c.main(args, out=io.StringIO())
+            plain = json.loads(report.read_text())['decision']['reasons']
+            strict_code = c.main([*args, '--mandatory', '6'], out=io.StringIO())
+            strict = json.loads(report.read_text())['decision']['reasons']
+        self.assertNotIn('mandatory constraint 6', ' '.join(plain))
+        self.assertIn('mandatory constraint 6 is open', ' '.join(strict))   # wired through judge, not only rescore
+        self.assertEqual(strict_code, 1)
+
+    def test_the_boundary_is_a_confident_yes_exactly(self):
+        need = (1 + rubric()['decision']['min_confidence']) / 2
+        at = MandatoryTests.scored(self, need)
+        below = MandatoryTests.scored(self, need - 0.01)
+        self.assertEqual(c.decide(at, rubric(), mandatory=[2])['action'], 'recommend')
+        self.assertEqual(c.decide(below, rubric(), mandatory=[2])['action'], 'escalate')
+
+    def test_rescore_keeps_recorded_mandatory_unless_cleared(self):
+        folder = Path(tempfile.mkdtemp())
+        strict = folder / 'strict.json'
+        live = json.loads((EXAMPLE / 'live-run.jev-1.13.0.json').read_text())
+        c.write_json(strict, c.rescore(live, rubric(), mandatory=[6]))
+        out = io.StringIO()
+        with mock.patch.object(c.sys, 'stderr', io.StringIO()):
+            kept = c.main(['rescore', '--report', str(strict), '--rubric', str(c.DEFAULT_RUBRIC), '--out', str(folder / 'k.json')], out=out)
+            cleared = c.main(['rescore', '--report', str(strict), '--rubric', str(c.DEFAULT_RUBRIC), '--mandatory',
+                              '--out', str(folder / 'c.json')], out=io.StringIO())
+        self.assertEqual(json.loads((folder / 'k.json').read_text())['mandatory_constraints'], [6])
+        self.assertEqual(json.loads((folder / 'c.json').read_text())['mandatory_constraints'], [])
+        self.assertEqual((kept, cleared), (1, 1))  # the saved run escalates on confidence anyway
+
+    def test_the_opt_in_headroom_rubric_loads_and_keeps_its_escape_clause(self):
+        r = c.load_rubric(ROOT / 'rubrics' / 'system_design_headroom.json')
+        head = next(d for d in r['dimensions'] if d['id'] == 'headroom')
+        self.assertEqual(len(head['levels']), 4)
+        self.assertTrue(head['instructions'].startswith('First, does `decision_brief` say the load or size will grow'))
+        self.assertIn('states no coming growth', head['levels'][-1])     # the top level, so no growth costs nothing
+        self.assertIn('does not say so', head['levels'][0])
+        self.assertAlmostEqual(sum(d['weight'] for d in r['dimensions']), 1.0)
+        default = c.load_rubric(c.DEFAULT_RUBRIC)
+        self.assertEqual([d['id'] for d in r['dimensions'] if d['id'] != 'headroom'], [d['id'] for d in default['dimensions']])
+
+
 class ShadowGateTests(unittest.TestCase):
     LIVE = EXAMPLE / 'live-run.jev-1.13.0.json'
 

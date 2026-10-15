@@ -32,7 +32,7 @@ python3 council.py --help
 
 ```sh
 python3 -m unittest -q tests.test_council        # the test suite, offline
-python3 council.py rescore --report examples/coordinator-host/live-run.jev-1.13.0.json --rubric rubrics/system_design.v1.json
+python3 council.py rescore --report examples/coordinator-host/live-run.jev-1.13.0.json --rubric rubrics/system_design.json
 python3 council.py judge --judge-cmd claude --brief examples/coordinator-host/brief.md --proposals examples/coordinator-host/*.md
 ```
 
@@ -197,6 +197,14 @@ How the council is run with other seats (Claude, Codex) is in [PROTOCOL.md](PROT
 The report header names the model version that answered and the input tokens used. `jev-latest` is an alias that moves when TypeSafe ships a release, so once `min_confidence` and the veto thresholds have been tuned against real decisions, pin that version with `--typesafe-model` and move on your own schedule.
 
 `rubrics/system_design.json` scores constraint fit (per constraint), failure handling, verifiability, simplicity, reversibility and evidence, and vetoes proposals that depend on something the brief rules out or that leave the decision unanswered (a rule that says which option to pick once named facts are checked counts as an answer). Its weights and thresholds are starting points, not findings. `rescore` only accepts a rubric that asks exactly the same questions: reworded instructions or levels need a new judge run.
+
+**`rubrics/system_design_headroom.json` (opt-in)** adds a headroom question: does a proposal still meet the constraints at the load the brief says is coming, worked out from the numbers given? It came from `examples/probes/scale-trap`, where it put both traps last.
+
+It is not the default, because it has two measured costs:
+- **It inflates briefs with no growth.** Every proposal gets full headroom credit, so totals rise and margins shrink by about 13%, and a weak sole survivor can clear `min_total`.
+- **It can loosen constraint fit.** In one holdout run, with it present, the judge gave a design 4 of 6 votes for meeting a deadline it breaks; without it, 0 of 5.
+
+Use it for briefs that state growth. Also state that load as a hard constraint and mark it `--mandatory`, which costs nothing.
 
 ## What is and is not validated
 

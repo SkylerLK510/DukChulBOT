@@ -74,3 +74,13 @@ All four runs escalate, because the two good proposals are within `min_margin` o
    - **Overfitting.** The headroom question was written by the author of the first case.
    - **Coverage.** No case yet has the breaking load stated only in a proposal, nor growth with no number.
    - **Neutrality.** Claude does not reliably apply the question's escape clause on a brief with no growth (see 3).
+
+**Later the same day: tried as the default, then kept opt-in.**
+
+- **The rewording.** The question was reworded to ask first whether the brief states any coming growth. With Claude, a brief with no growth then got the top level in every sample, and both traps got level 0 in every sample.
+- **The review.** A blind review then found two costs that kept it out of the default rubric:
+  - **Free credit when there is no growth.** On such a brief every proposal gets full headroom credit, so totals rise, margins shrink by about 13%, and a weak sole survivor can clear `min_total`.
+  - **Leniency elsewhere.** In the holdout run with the question present, the judge gave the trap 4 of 6 votes for meeting the 55 s deadline it breaks, against 0 of 5 without it. This is the second time adding the question moved another answer the wrong way.
+- **Status.** The default stayed v1, as the pre-registered fallback required, since only one of the two judges had been checked.
+- **Where it lives.** The reworded question is `rubrics/system_design_headroom.json`, for briefs that state growth.
+- **The free fix.** Stating the load as a hard constraint and marking it `--mandatory` costs nothing.
