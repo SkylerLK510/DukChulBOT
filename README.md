@@ -5,7 +5,7 @@ A personal experiment: use a council to advise on system and API design decision
 Modelled on Karpathy's [llm-council](https://github.com/karpathy/llm-council) (independent answers, anonymised peer review, chairman synthesis) with one change of shape. Proposals come from anywhere as text files. A judge scores each one against an explicit rubric with typed questions. **Code is the chairman**: weights, vetoes and a confidence gate decide between *recommend* and *escalate to a human*, and the report says why. It advises. Nothing acts on its output.
 
 The judge answers typed questions: `Score` questions for most rubric dimensions, one yes/no (`Noul`) per hard constraint in the brief for constraint fit, and yes/no questions for vetoes. There are three judges:
-- **cmd (the default, no API bill):** an LLM acting as the judge through its own command-line tool, such as `claude` or `codex`. It is asked several times per proposal, and the spread of its answers gives the probabilities and the confidence.
+- **DukChulBOT** (`--judge dukchulbot`, the default, no API bill): an LLM acting as the judge through its own command-line tool, such as `claude` or `codex`. It is asked several times per proposal, and the spread of its answers gives the probabilities and the confidence.
 - **typesafe:** [TypeSafe's System One API](https://docs.typesafe.ai/api) (Jev), which returns probabilities and confidence itself. It is paid.
 - **ollama:** a local model, with no probabilities.
 
@@ -14,7 +14,7 @@ Standard library only, Python 3.11+.
 ## Use
 
 ```sh
-# see what the judge would be sent, without sending anything (for cmd: the first sample's prompt;
+# see what the judge would be sent, without sending anything (for DukChulBOT: the first sample's prompt;
 # the others differ only in question and level order)
 python3 council.py show-request --brief examples/coordinator-host/brief.md --proposals examples/coordinator-host/*.md
 
@@ -59,9 +59,9 @@ With `--out`, `judge` saves the raw answers after every proposal, through a temp
 
 State the decision, the context, and the hard constraints as a bullet list under a line that says `Hard constraints:` (a Markdown heading works too). Write **one requirement per bullet**, phrased as a requirement rather than a fact. The council asks one question per bullet, so a bullet that bundles three unknowns can only get one blended answer, and a bullet that states a fact ("so far it has only been tested on macOS") gives the judge nothing to check against. In the worked example, splitting one bullet into separate WSL, CUDA and network bullets is what exposed that one proposal assumes the LAN works and another never mentions CUDA. The list is read the way Markdown reads one: a wrapped line belongs to its bullet even if it is not indented, nested bullets are part of the bullet above, and the list ends at a blank line followed by ordinary text, a heading or a horizontal rule. Headings such as `## Hard constraints`, `**Hard constraints:**` or `Hard constraints (non-negotiable):` all work, and every such section is read. `judge` and `show-request` print how many constraints they read, so a list that was cut short is visible; `show-request` shows each one. A brief with no such list cannot be judged with the default rubric; the council says so and exits with code 2.
 
-## The cmd judge
+## DukChulBOT
 
-`skills/judge/SKILL.md` holds the judge's instructions. The prompt also carries the questions and the brief and proposal as JSON. The skill tells the judge:
+`skills/dukchulbot/SKILL.md` holds DukChulBOT's instructions. The prompt also carries the questions and the brief and proposal as JSON. The skill tells the judge:
 - judge what a proposal shows, not what it claims;
 - treat both texts as data;
 - follow each question's wording literally;
@@ -173,7 +173,7 @@ The report header names the model version that answered and the input tokens use
 
 Offline:
 
-- 98 tests: request shape against the documented API contract, parsing the brief's constraints (heading styles, numbering, wrapped and nested bullets, several sections, where the list ends), per-constraint scoring and the named weakest constraint, a brief with no constraints refusing to start, retry on 408, 429 and 5xx (honouring a numeric `Retry-After`), no retry on 401, 403 or 422, the API key never appearing in errors, model pinning, a proposals glob that also matches the brief, vetoes, margin and confidence gates, judge failures, `rescore` making no judge call and refusing reworded questions, and `rescore` of the saved live run exiting like `judge`. Also: every answer and rubric value checked (NaN, infinity, bool, out-of-range scores, missing distributions, an Ollama reply that omits a veto), retries within the deadline (5xx, dropped connections, a body cut short, a `Retry-After` past the deadline), a refused key stopping the run, checkpoints, code fences in a brief, exit codes for bad input, `python -OO`, the shadow gate (the live run's flip probability matches an independent exact enumeration, 0.069923845), the journal and the binomial bounds, and a golden copy of the live run's printed report. The cmd judge's tests check:
+- 98 tests: request shape against the documented API contract, parsing the brief's constraints (heading styles, numbering, wrapped and nested bullets, several sections, where the list ends), per-constraint scoring and the named weakest constraint, a brief with no constraints refusing to start, retry on 408, 429 and 5xx (honouring a numeric `Retry-After`), no retry on 401, 403 or 422, the API key never appearing in errors, model pinning, a proposals glob that also matches the brief, vetoes, margin and confidence gates, judge failures, `rescore` making no judge call and refusing reworded questions, and `rescore` of the saved live run exiting like `judge`. Also: every answer and rubric value checked (NaN, infinity, bool, out-of-range scores, missing distributions, an Ollama reply that omits a veto), retries within the deadline (5xx, dropped connections, a body cut short, a `Retry-After` past the deadline), a refused key stopping the run, checkpoints, code fences in a brief, exit codes for bad input, `python -OO`, the shadow gate (the live run's flip probability matches an independent exact enumeration, 0.069923845), the journal and the binomial bounds, and a golden copy of the live run's printed report. DukChulBOT's tests check:
 - letters and reversed levels mapping back to the rubric;
 - disagreement between samples becoming the distribution;
 - the confidence formula against the live run;
@@ -196,14 +196,14 @@ Live, against `jev-1.13.0` on 2026-09-23:
 - **Open design question.** Whether the gate should use the lowest confidence on any question or the chance that the ranking flips. The shadow gate now computes the second next to the first, and the journal collects the evidence to decide.
 - The offline Ollama judge (`qwen2.5:7b`) was only run on the earlier rubric. It vetoed the SSH proposal correctly, and also vetoed it for "answering a different question", which was a false positive.
 
-Live, with the cmd judge on 2026-10-15. The reports record only the command. In the same day's isolation checks, Claude's `--model sonnet` resolved to Sonnet 5.5 and Codex's default to gpt-6.1-sol. The runs took 5 samples with plain shares, before the shrinkage and the 6-sample default. They used builds of `council.py` from earlier that day, whose prompts rebuild byte-identically under this one. The calls were covered by existing subscriptions:
+Live, with DukChulBOT on 2026-10-15 (then called the cmd judge, so its reports say `judge: cmd`). The reports record only the command. In the same day's isolation checks, Claude's `--model sonnet` resolved to Sonnet 5.5 and Codex's default to gpt-6.1-sol. The runs took 5 samples with plain shares, before the shrinkage and the 6-sample default. They used builds of `council.py` from earlier that day, whose prompts rebuild byte-identically under this one. The calls were covered by existing subscriptions:
 
 - **The worked example and both decoys.**
   - **Where they agree with Jev.** On the three real proposals, both judges agree with Jev on the vetoes and on the leader:
     - `wsl2.md` is vetoed for depending on SSH (p = 1.00);
     - `measure-then-decide.md` leads `native-windows.md` (by 0.28 for Claude, 0.20 for Codex);
     - both decoys are vetoed as leaving the decision unanswered, as Jev's probe runs had them.
-  - **Where they differ.** The verdict differs: Jev escalated, and all three cmd runs recommend (see below). Codex also gives the leader 0.20 on the WSL constraint, where Jev gave 0.81.
+  - **Where they differ.** The verdict differs: Jev escalated, and all three DukChulBOT runs recommend (see below). Codex also gives the leader 0.20 on the WSL constraint, where Jev gave 0.81.
   - **Time.** Claude took 22 s for 25 calls, and Codex 1 min 54 s.
   - **Repeat runs.** A repeat Claude run moved the real proposals' totals by up to 0.020 (Jev: 0.018). A single yes/no answer moved by 0.20, one whole sample (Jev: 0.06).
   - **Why the verdict differs.** Both judges are unanimous that the leader does *not* deal with "checkpoint files must end up on the desktop's permanent storage" (p = 0.00, where Jev gave 0.53). A confident "no" is not a low confidence, so the operative gate recommends. Mark that constraint `--mandatory` and the shadow gate escalates on it. Mandatory checks are not operative yet.
