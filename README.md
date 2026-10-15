@@ -14,7 +14,8 @@ Standard library only, Python 3.11+.
 ## Use
 
 ```sh
-# see exactly what the judge would be sent, without sending anything
+# see what the judge would be sent, without sending anything (for cmd: the first sample's prompt;
+# the others differ only in question and level order)
 python3 council.py show-request --brief examples/coordinator-host/brief.md --proposals examples/coordinator-host/*.md
 
 # judge with Claude through its CLI, 5 samples per proposal (the default)
@@ -67,28 +68,47 @@ State the decision, the context, and the hard constraints as a bullet list under
 - answer each question on its own;
 - commit to one answer rather than hedge.
 
-For each proposal, `council.py` runs the command `--samples` times (default 5) and reads one pick per question from each reply.
+For each proposal, `council.py` runs the command `--samples` times (default 6) and reads one pick per question from each reply.
 - **Several commands.** With more than one `--judge-cmd`, samples take the commands in turn.
-- **Probabilities.** A level's probability is the share of samples that chose it, and a yes/no answer's probability is the share that said yes.
+- **Probabilities.** A level's probability is the share of samples that chose it, and a yes/no answer's probability is the share that said yes. Each share is shrunk toward an even split by one pseudo-sample: half a yes and half a no, or 1/n per level. So a few agreeing samples never read as certainty: 6 of 6 reads 0.93, and 0 of 6 reads 0.07. The pseudo-count of 1 is a convention, not a calibration.
 - **Confidence.** A Score's confidence uses TypeSafe's published formula, which reproduces Jev's own confidence within 0.01 on all 15 Score answers of the saved live run. A yes/no answer's confidence is `|2p − 1|`, as before.
 
-Why sampling, not a confidence the model states: for an LLM judge, agreement across samples predicted human agreement better than verbalised confidence (Jung et al., ICLR 2025: AUROC 0.72 against 0.55). Neither is calibrated, and with 5 samples a yes/no probability moves in steps of 0.2. One sample has no distribution, so `--samples 1` behaves like the Ollama judge and needs `--allow-missing-confidence`.
+Why sampling, not a confidence the model states: for an LLM judge, agreement across samples predicted human agreement better than verbalised confidence (Jung et al., ICLR 2025: AUROC 0.72 against 0.55). Neither is calibrated.
+
+**Samples mostly agree.** In the live runs below, at 5 samples, 84% of Claude's answers and 90% of Codex's were unanimous. Jev gave confidence 1.00 on 1 of 42 answers. Without the shrinkage those would all read as certainty.
+- **Not the skill's wording.** Removing its "commit, don't hedge" rule did not change this: 81% with the rule, 84% without, over 140 answers each (`design-council-research/judge-oct15/commit-ab`).
+- **The default is 6, not 5.** With 6 samples, a veto that 4 of 6 samples give (0.64) lands inside the shadow gate's 0.06 band around the 0.7 threshold, and the panel splits evenly.
+- **One sample.** One sample has no distribution, so `--samples 1` behaves like the Ollama judge and needs `--allow-missing-confidence`.
 
 Each sample differs from the last in three ways:
 - **Neutral keys.** The judge sees `q1`, `q2` and so on, never the rubric's ids.
 - **Question order** is shuffled.
-- **Score levels** are lettered in forward order on even samples and reversed on odd ones. Level and criterion order move rubric scores (Xu et al., Findings of EMNLP 2026), so the order effects spread across samples instead of tilting all of them the same way.
+- **Score levels** are lettered worst-first or best-first. Each command alternates direction over its own samples, so in a panel no command always sees one order. With an odd `--samples` the split is 3:2, not even. Level and criterion order move rubric scores (Xu et al., Findings of EMNLP 2026), so the order effects spread across samples instead of tilting all of them the same way.
 
 **How a run is handled:**
-- **Isolation.** Every run starts in an empty temporary folder, so no project instructions, memory or files reach the judge.
-- **Replies.** A reply may wrap its JSON in prose or a code fence.
+- **Isolation.** Every run starts in an empty temporary folder, so no project instructions or files load from the working folder.
+  - **Not a sandbox.** The folder is not a file-system boundary.
+  - **Environment.** The command gets the caller's environment without `TYPESAFE_API_KEY`.
+  - **Timeouts.** It runs in a session of its own, so a timeout kills it and everything it started.
+- **Replies.** A reply must hold exactly one top-level JSON object with exactly the questions' keys, bare or inside prose or a code fence. Nested objects are never read, and an object that repeats a key does not count. A second matching object, such as JSON quoted from a proposal, makes the reply ambiguous.
 - **Retries.** A reply with a missing or invalid answer is asked again once, and then the proposal is an error. A missing veto is never read as "no".
-- **Stopping.** A command that cannot start stops the run.
-- **Provenance.** The report keeps every sample's picks, the commands and the skill's hash.
+- **Stopping.** A command that cannot start stops the run, once the proposal's samples already running have finished.
+- **Provenance.**
+  - For every answered proposal, the report keeps every sample's picks.
+  - It records the commands and the skill's hash.
+  - A proposal with a failed sample keeps only its error.
+  - The journal includes the judge's whole configuration in the procedure that `validate` groups by.
 
-The presets `claude` and `codex` expand to commands that were checked to give the plain model and nothing else:
-- `claude -p --setting-sources project --strict-mcp-config --disable-slash-commands --tools "" --no-session-persistence --model sonnet`. Without `--setting-sources`, the Claude CLI would load the user's default agent.
-- `codex exec --skip-git-repo-check --ephemeral -s read-only --color never -`.
+The presets `claude` and `codex` expand to the commands below. They were checked on 2026-10-15 by asking the judge what instructions and tools it had.
+- **`claude`:** `claude -p --setting-sources project --strict-mcp-config --disable-slash-commands --tools "" --no-session-persistence --model sonnet`.
+  - Its system prompt is the plain Agent SDK one.
+  - Without `--setting-sources`, the Claude CLI would load the user's default agent.
+- **`codex`:** `codex exec --ignore-user-config --ignore-rules --disable apps --disable plugins -c 'web_search="disabled"' -c 'model_reasoning_effort="high"' --skip-git-repo-check --ephemeral -s read-only --color never -`.
+  - It skips the user's config, MCP servers, plugins and web search.
+  - It keeps Codex's built-in shell tools, sandboxed read-only in the empty folder.
+  - Its reasoning is pinned to high, which is what the live Codex runs below used through the user config.
+
+A custom command is run as given, with the caller's environment, so its isolation is up to you.
 
 ## How a decision is made
 
@@ -165,7 +185,7 @@ Offline:
 
 Live, against `jev-1.13.0` on 2026-09-23:
 
-- **The worked example** (3 requests, about 8.5k input tokens in total, 0.2 to 0.7 s per request). `wsl2.md` is vetoed at 0.98 for depending on SSH, which the brief forbids. `measure-then-decide.md` leads `native-windows.md` by 0.17 to 0.18 in both runs. It still escalates, and now says why in terms a person can check: it is unclear whether the leader deals with "Checkpoint files must end up on the desktop's permanent storage" (p = 0.49 to 0.52), which is the same gap the blind graders found. The report is saved as `examples/coordinator-host/live-run.jev-1.13.0.json`.
+- **The worked example** (3 requests, about 8.5k input tokens in total, 0.2 to 0.7 s per request). `wsl2.md` is vetoed at 0.98 for depending on SSH, which the brief forbids. `measure-then-decide.md` leads `native-windows.md` by 0.17 to 0.18 in both runs. It still escalates, and now says why in terms a person can check: it is unclear whether the leader deals with "Checkpoint files must end up on the desktop's permanent storage" (p = 0.53 in the saved run), which is the same gap the blind graders found. The report is saved as `examples/coordinator-host/live-run.jev-1.13.0.json`.
 - **Repeat runs are close but not identical.** Across identical requests, totals moved by up to 0.018, a Noul by up to 0.06 and a Score's confidence by up to 0.17. Keep `min_margin` and veto thresholds well clear of that.
 - **Per-constraint wording.** Three wordings were asked side by side on the three proposals and both decoys, and graded blind: "names it or states how", "states how its design meets it" and "takes it into account". Only the second ranked both decoys below every real proposal. The first gave a proposal that recommends nothing credit for listing trade-offs, and the third gave the off-topic decoy 0.35 to 0.50 on constraints it never touches. The adopted version rewords the question to "say what in its chosen design or plan meets" the constraint and takes stricter criteria from the adjudicator: silence does not count, a bare assertion does not count, trade-off talk without a chosen design does not count, and a concrete step counts even if it does not name the constraint. Together (they were not tested separately) these took the no-recommendation decoy from 0.28 to 0.08. An example sentence in those criteria was dropped because it was lifted from one of the test proposals and raised that proposal's answer from 0.70 to 0.85.
 - **One gray area remains.** `native-windows.md` never mentions remote access, and Jev still gives 0.63 to 0.64 on "Nothing may depend on SSH" because nothing in the design needs it; the graders gave 0.05. At that value (confidence 0.26) the gate would list it among the constraints it is unsure about rather than trust it.
@@ -176,20 +196,21 @@ Live, against `jev-1.13.0` on 2026-09-23:
 - **Open design question.** Whether the gate should use the lowest confidence on any question or the chance that the ranking flips. The shadow gate now computes the second next to the first, and the journal collects the evidence to decide.
 - The offline Ollama judge (`qwen2.5:7b`) was only run on the earlier rubric. It vetoed the SSH proposal correctly, and also vetoed it for "answering a different question", which was a false positive.
 
-Live, with the cmd judge on 2026-10-15 (Claude Sonnet 5.5 and Codex gpt-6.1-sol, 5 samples, free under existing subscriptions):
+Live, with the cmd judge on 2026-10-15. The reports record only the command. In the same day's isolation checks, Claude's `--model sonnet` resolved to Sonnet 5.5 and Codex's default to gpt-6.1-sol. The runs took 5 samples with plain shares, before the shrinkage and the 6-sample default. They used builds of `council.py` from earlier that day, whose prompts rebuild byte-identically under this one. The calls were covered by existing subscriptions:
 
 - **The worked example and both decoys.**
-  - **Agreement with Jev.** Both judges agree with Jev on everything that matters:
+  - **Where they agree with Jev.** On the three real proposals, both judges agree with Jev on the vetoes and on the leader:
     - `wsl2.md` is vetoed for depending on SSH (p = 1.00);
     - `measure-then-decide.md` leads `native-windows.md` (by 0.28 for Claude, 0.20 for Codex);
-    - both decoys are vetoed as leaving the decision unanswered.
+    - both decoys are vetoed as leaving the decision unanswered, as Jev's probe runs had them.
+  - **Where they differ.** The verdict differs: Jev escalated, and all three cmd runs recommend (see below). Codex also gives the leader 0.20 on the WSL constraint, where Jev gave 0.81.
   - **Time.** Claude took 22 s for 25 calls, and Codex 1 min 54 s.
-  - **Repeat runs.** A repeat Claude run moved the real proposals' totals by up to 0.020 (Jev: 0.018).
-  - **One difference matters.** Both judges are unanimous that the leader does *not* deal with "checkpoint files must end up on the desktop's permanent storage" (p = 0.00, where Jev gave 0.53). A confident "no" is not a low confidence, so the operative gate recommends. Mark that constraint `--mandatory` and the shadow gate escalates on it. Mandatory checks are not operative yet.
+  - **Repeat runs.** A repeat Claude run moved the real proposals' totals by up to 0.020 (Jev: 0.018). A single yes/no answer moved by 0.20, one whole sample (Jev: 0.06).
+  - **Why the verdict differs.** Both judges are unanimous that the leader does *not* deal with "checkpoint files must end up on the desktop's permanent storage" (p = 0.00, where Jev gave 0.53). A confident "no" is not a low confidence, so the operative gate recommends. Mark that constraint `--mandatory` and the shadow gate escalates on it. Mandatory checks are not operative yet.
 - **A design that is right today and wrong at the stated scale** (`examples/probes/scale-trap`, pre-registered in its `EXPECTED.md`, results in its `RESULTS.md`). When the growth to 200 workers sits only in the brief's context:
   - **Both judges miss it.** They rank the design that breaks at that load second, ahead of the one sized for it, and the run escalates only because the lead is under `min_margin`.
-  - **Stating the scale fixes it.** As a hard constraint, the scale drops the trap to third.
-  - **So does a headroom question.** Asking the judge to work out the stated growth from the numbers (`rubric-headroom.json`) gives the trap 0.00 on headroom in every sample, without changing the worked example's verdict.
+  - **Stating the scale as a hard constraint helps.** Both judges then answer that the trap does not hold at that load (p = 0.00). Claude ranks it third. Codex still ranks it second, 0.007 ahead of the design sized for it, which the probe's own flaw explains (see RESULTS.md).
+  - **So does an added headroom question.** Asking the judge to work out the stated growth from the numbers (`rubric-headroom.json`) gives the trap 0.00 on headroom in every sample, without changing the worked example's verdict. It works through its own weight: drop that weight from the same answers and the trap is second again.
   - **A second, independent case.** Codex wrote it blind, and there the broken constraint is itself a deadline. Both judges caught it with the default rubric too. The blind spot is the indirect failure: growth to backlog to a missed constraint.
 
 What that does not show:

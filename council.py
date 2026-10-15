@@ -34,6 +34,7 @@ import platform
 import random
 import re
 import shlex
+import signal
 import string
 import subprocess
 import sys
@@ -51,13 +52,16 @@ TYPESAFE_URL = 'https://api.typesafe.ai/v1/systemone'
 DEFAULT_MODEL = 'jev-latest'
 DEFAULT_RUBRIC = Path(__file__).parent / 'rubrics' / 'system_design.json'
 SKILL = Path(__file__).parent / 'skills' / 'judge' / 'SKILL.md'  # the command judge's instructions
-# Commands checked to give the plain model and nothing else: no user settings (the Claude CLI
-# would otherwise load the user's default agent), skills, MCP servers, tools or saved session.
+# Commands checked to give the plain model with no user settings (the Claude CLI would otherwise
+# load the user's default agent), skills, MCP servers, plugins, web search or saved session. Codex
+# keeps its built-in shell tools, sandboxed read-only in an empty folder.
 # CommandJudge also runs every command in an empty folder, so no project instructions or memory load.
 JUDGE_PRESETS = {
     'claude': ('claude -p --setting-sources project --strict-mcp-config --disable-slash-commands --tools "" '
                '--no-session-persistence --model sonnet'),
-    'codex': 'codex exec --skip-git-repo-check --ephemeral -s read-only --color never -',
+    'codex': ('codex exec --ignore-user-config --ignore-rules --disable apps --disable plugins '
+              '''-c 'web_search="disabled"' -c 'model_reasoning_effort="high"' --skip-git-repo-check --ephemeral '''
+              '-s read-only --color never -'),
 }
 TOOL_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 # Retry what TypeSafe's own SDK retries (RetryPolicy defaults): 408, 429 and every 5xx,
@@ -467,19 +471,20 @@ def score_confidence(probabilities):
     return max(0.0, 1 - distance / spread)
 
 
-def judge_prompt(brief, proposal, questions, sample):
+def judge_prompt(brief, proposal, questions, sample, reverse=None):
     """One sample's prompt, and the map from each neutral key (q1, q2, ...) to its question id
     and, for a Score, letter -> level. The judge never sees the rubric's ids. Question order is
-    shuffled per sample, and Score levels are lettered in forward order on even samples and
-    reversed on odd ones, so order effects spread across samples instead of tilting all of
-    them the same way (Xu et al., Findings of EMNLP 2026)."""
+    shuffled per sample, and Score levels are lettered best-last or, with `reverse`, best-first
+    (by default on odd samples), so order effects spread across samples instead of tilting all
+    of them the same way (Xu et al., Findings of EMNLP 2026)."""
     ids = list(questions)
     random.Random(sample).shuffle(ids)
+    reverse = sample % 2 if reverse is None else reverse
     lines, keys = [], {}
     for n, qid in enumerate(ids, 1):
         q, key = questions[qid], f'q{n}'
         if q['type'] == 'score':
-            levels = list(enumerate(q['criteria']))[::-1 if sample % 2 else 1]
+            levels = list(enumerate(q['criteria']))[::-1 if reverse else 1]
             lettered = list(zip(string.ascii_lowercase, levels))
             keys[key] = (qid, {letter: level for letter, (level, _) in lettered})
             shown = '; '.join(f'({letter}) {text}' for letter, (_, text) in lettered)
@@ -492,23 +497,47 @@ def judge_prompt(brief, proposal, questions, sample):
     return f"{skill_prompt()}\n\n## Questions\n\n" + '\n'.join(lines) + f"\n\n## Input\n\n{state}\n", keys
 
 
+class _Object(dict):
+    repeats_a_key = False
+
+
+def _object(pairs):
+    obj = _Object(pairs)
+    obj.repeats_a_key = len(obj) < len(pairs)
+    return obj
+
+
 def read_reply(text, keys):
-    """{question id: level or bool} from a judge's reply. The reply may wrap its JSON object in
-    prose or a code fence; the last object with the most keys is read. Anything else raises
-    ValueError: a missing or non-bool veto is never read as false, which would let it pass."""
-    decoder, found, missing = json.JSONDecoder(parse_constant=_no_constant, parse_float=_finite_float), None, None
-    for start in (i for i, ch in enumerate(text) if ch == '{'):
+    """{question id: level or bool} from a judge's reply. The reply must hold exactly one
+    top-level JSON object with exactly the questions' keys, bare or inside prose or a code
+    fence. An object nested in another is never read, and an object that repeats a key does not
+    count, so JSON quoted from a proposal cannot stand in for the answer: a second matching
+    object makes the reply ambiguous. Anything else raises ValueError, and a missing or non-bool
+    veto is never read as false, which would let it pass."""
+    decoder = json.JSONDecoder(parse_constant=_no_constant, parse_float=_finite_float, object_pairs_hook=_object)
+    found, nearest, start = [], None, 0
+    while (start := text.find('{', start)) != -1:
         try:
-            obj = decoder.raw_decode(text, start)[0]
+            obj, end = decoder.raw_decode(text, start)
         except ValueError:
+            start += 1
             continue
-        gone = [qid for key, (qid, _) in keys.items() if key not in obj] if isinstance(obj, dict) else None
-        if gone is not None and (missing is None or len(gone) <= len(missing)):
-            found, missing = obj, gone
-    if found is None:
-        raise ValueError('the reply has no JSON object')
-    if missing:
-        raise ValueError(f"no answer for {', '.join(missing)}")
+        start = end  # skip the object's inside: a nested object is never the answer
+        if not isinstance(obj, dict):
+            continue
+        if set(obj) == set(keys) and not obj.repeats_a_key:
+            found.append(obj)
+        elif nearest is None or len(set(keys) - set(obj)) < len(set(keys) - set(nearest)):
+            nearest = obj
+    if len(found) > 1:
+        raise ValueError(f'the reply holds {len(found)} answer objects, so it is ambiguous')
+    if not found:
+        if nearest is None:
+            raise ValueError('the reply has no JSON object')
+        missing = [qid for key, (qid, _) in keys.items() if key not in nearest]
+        raise ValueError(f"no answer for {', '.join(missing)}" if missing else
+                         'the answer object repeats a key or has keys that are not questions')
+    found = found[0]
     picks = {}
     for key, (qid, letters) in keys.items():
         value = found[key]
@@ -529,13 +558,14 @@ class CommandJudge:
     one command (round robin over several) with skills/judge/SKILL.md, the questions and the input
     on stdin, in an empty folder, and reads one pick per question from the reply. Disagreement
     between samples is the uncertainty: a level's probability is the share of samples that chose
-    it, a Noul's the share that said true. For a judge, sampled agreement tracked human agreement
+    it, a Noul's the share that said true, each shrunk by one pseudo-sample toward an even split.
+    For a judge, sampled agreement tracked human agreement
     better than a confidence the model states (Jung et al., ICLR 2025: AUROC 0.72 against 0.55),
     but it is not calibrated either. One sample has no distribution, so its answers carry
     confidence None, as the Ollama judge's do."""
     name = 'cmd'
 
-    def __init__(self, commands, samples=5, timeout_s=600.0, max_attempts=2, runner=None):
+    def __init__(self, commands, samples=6, timeout_s=600.0, max_attempts=2, runner=None):
         if not commands:
             raise JudgeError(f"the command judge needs --judge-cmd: a preset ({', '.join(JUDGE_PRESETS)}) "
                              'or a full command that reads a prompt on stdin')
@@ -552,16 +582,33 @@ class CommandJudge:
                      'max_attempts': max_attempts, 'skill_sha256': sha256(SKILL.read_bytes())}
 
     def run_command(self, argv, prompt):
-        """stdout of one run, in an empty folder so no project instructions, memory or files
-        reach the judge."""
-        # ceiling: stdout is read whole; a command that floods it fills memory
-        with tempfile.TemporaryDirectory(prefix='council-judge-') as cwd:
-            done = subprocess.run(argv, input=prompt, check=False, capture_output=True, text=True, encoding='utf-8',
-                                  errors='replace', cwd=cwd, timeout=self.timeout_s)
-        if done.returncode:
-            tail = ' '.join(done.stderr.split())[-300:]
-            raise JudgeError(f'{Path(argv[0]).name} exited with {done.returncode}' + (f': {tail}' if tail else ''))
-        return done.stdout
+        """stdout of one run. The working folder is empty, so no project instructions or files
+        load from it; it is not a file-system boundary. The command gets the caller's
+        environment without the TypeSafe key, in a session of its own, so a timeout kills it and
+        everything it started, not only the direct child."""
+        # ceiling: stdout is read whole; a command that floods it fills disk and memory
+        env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
+        # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
+        # started still holds stdout open; whatever it started is then killed with its session.
+        with tempfile.TemporaryDirectory(prefix='council-judge-') as cwd, tempfile.TemporaryFile() as out, \
+                tempfile.TemporaryFile() as err:
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=err, cwd=cwd, env=env,
+                                    start_new_session=True)
+            try:
+                proc.communicate(prompt.encode('utf-8'), timeout=self.timeout_s)
+            finally:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL) if hasattr(os, 'killpg') else proc.kill()
+                except (ProcessLookupError, PermissionError):
+                    pass
+                proc.wait()
+            out.seek(0)
+            err.seek(0)
+            stdout, stderr = out.read().decode('utf-8', 'replace'), err.read().decode('utf-8', 'replace')
+        if proc.returncode:
+            tail = ' '.join(stderr.split())[-300:]
+            raise JudgeError(f'{Path(argv[0]).name} exited with {proc.returncode}' + (f': {tail}' if tail else ''))
+        return stdout
 
     def sample(self, k, prompt, keys):
         """Sample k's picks and the attempts it took. A failed or unreadable reply is asked again;
@@ -580,19 +627,31 @@ class CommandJudge:
 
     def judge(self, brief, proposal, rubric):
         questions = build_questions(rubric, parse_constraints(brief))
-        jobs = [(k, *judge_prompt(brief, proposal, questions, k)) for k in range(self.samples)]
+        # each command alternates direction over its own samples, so in a panel no command always sees one order
+        jobs = [(k, *judge_prompt(brief, proposal, questions, k, (k // len(self.argvs)) % 2)) for k in range(self.samples)]
         with concurrent.futures.ThreadPoolExecutor(self.samples) as pool:
             results = list(pool.map(lambda job: self.sample(*job), jobs))
         picks, k = [r[0] for r in results], self.samples
         answers = {}
         for qid, q in questions.items():
             values = [p[qid] for p in picks]
-            if q['type'] == 'noul':
-                answers[qid] = {'type': 'noul', 'noul': sum(values) / k, **({'confidence': None} if k == 1 else {})}
+            if k == 1:  # one pick is no distribution: confidence None, as for the Ollama judge
+                if q['type'] == 'noul':
+                    answers[qid] = {'type': 'noul', 'noul': float(values[0]), 'confidence': None}
+                else:
+                    probs = {str(i): float(values[0] == i) for i in range(len(q['criteria']))}
+                    answers[qid] = {'type': 'score', 'score': float(values[0]), 'probabilities': probs, 'confidence': None}
                 continue
-            probs = {str(i): values.count(i) / k for i in range(len(q['criteria']))}
-            answers[qid] = {'type': 'score', 'score': sum(values) / k, 'probabilities': probs,
-                            'confidence': score_confidence(probs) if k > 1 else None}
+            # Shares of k samples, shrunk toward an even split by one pseudo-sample (half a yes and half a no;
+            # 1/n per Score level), so agreement among a few samples never reads as certainty: 6 of 6 is 0.93.
+            # ceiling: the pseudo-count of 1 is a convention, not calibrated; tune it on labelled decisions.
+            if q['type'] == 'noul':
+                answers[qid] = {'type': 'noul', 'noul': (sum(values) + 0.5) / (k + 1)}
+                continue
+            n = len(q['criteria'])
+            probs = {str(i): (values.count(i) + 1 / n) / (k + 1) for i in range(n)}
+            answers[qid] = {'type': 'score', 'score': sum(int(i) * v for i, v in probs.items()), 'probabilities': probs,
+                            'confidence': score_confidence(probs)}
         return {'answers': answers, 'model': ' + '.join(sorted({Path(a[0]).name for a in self.argvs})), 'usage': None,
                 'request_sha256': sha256('\0'.join(job[1] for job in jobs).encode()),
                 'attempts': sum(r[1] for r in results),
@@ -1005,6 +1064,8 @@ def journal_run(path, report, report_path):
         'report_sha256': sha256(Path(report_path).read_bytes()), 'brief_sha256': report['brief_sha256'],
         'rubric_sha256': sha256(json.dumps(report['rubric'], sort_keys=True).encode()),
         'models': sorted({row['model'] for row in report['judged'] if row.get('model')}),
+        'judge_sha256': sha256(json.dumps({'judge': report.get('judge'), 'config': report.get('judge_config') or {}},
+                                          sort_keys=True).encode()),
         'mandatory_constraints': report.get('mandatory_constraints', []),
         'candidates': [row.get('proposal_sha256') for row in report['judged']],
         'operative': verdict(report['decision']),
@@ -1034,7 +1095,7 @@ def wrong_rate_bound(wrong, n, confidence):
 
 def validate(records):
     """Risk and coverage of each gate on labelled decisions, one table per procedure
-    (tool, rubric, models and mandatory constraints), so a later rescore with a tuned
+    (tool, rubric, judge configuration, models and mandatory constraints), so a later rescore with a tuned
     rubric adds a row instead of replacing the run you labelled. Within a procedure the
     latest run of each brief counts, against the latest label of that brief. A
     recommendation is wrong when its proposal is not the one you picked; an escalation
@@ -1046,7 +1107,8 @@ def validate(records):
                     k in r for k in ('tool_sha256', 'rubric_sha256', 'models', 'operative', 'shadow'))):
             raise ValueError(f'journal line {i} is not a record this tool wrote')
         if r['kind'] == 'run':
-            procedure = (r['tool_sha256'], r['rubric_sha256'], tuple(r['models']), tuple(r.get('mandatory_constraints', [])))
+            procedure = (r['tool_sha256'], r['rubric_sha256'], r.get('judge_sha256'), tuple(r['models']),
+                         tuple(r.get('mandatory_constraints', [])))
             runs[procedure, r['brief_sha256']] = (i, r)
         else:
             labels[r['brief_sha256']] = (i, r)
@@ -1065,10 +1127,10 @@ def validate(records):
     if len(groups) > 1:
         lines.append('Each procedure is counted on its own. Only one frozen in advance and run on decisions it was '
                      'not tuned on certifies anything.')
-    for (tool, rubric_hash, models, mandatory), pairs in groups.items():
+    for (tool, rubric_hash, judge_hash, models, mandatory), pairs in groups.items():
         late = sum(after for _, _, after in pairs)
-        lines += ['', f"procedure: tool {tool[:8]}, rubric {rubric_hash[:8]}, models {', '.join(models) or 'n/a'}, "
-                      f"mandatory {list(mandatory) or 'none'}"]
+        lines += ['', f"procedure: tool {tool[:8]}, rubric {rubric_hash[:8]}, judge {(judge_hash or 'n/a')[:8]}, "
+                      f"models {', '.join(models) or 'n/a'}, mandatory {list(mandatory) or 'none'}"]
         if late:
             lines.append(f'  {late} of {len(pairs)} runs were logged after their label: expected when replaying a '
                          'frozen procedure, worthless if the procedure was tuned on these labels')
@@ -1180,7 +1242,8 @@ def parse_args(argv):
             p.add_argument('--judge-cmd', action='append', metavar='CMD',
                            help=f"a preset ({', '.join(JUDGE_PRESETS)}) or a command that reads the prompt on stdin; "
                                 'repeat it for a panel, sampled in turn')
-            p.add_argument('--samples', type=int, default=5, help='runs per proposal for the cmd judge (default 5)')
+            p.add_argument('--samples', type=int, default=6,
+                           help='runs per proposal for the cmd judge (default 6: even, so a 2-command panel splits evenly)')
             p.add_argument('--ollama-url', default='http://localhost:11434')
             p.add_argument('--ollama-model', default='qwen2.5:7b')
         p.add_argument('--out', help='write the full JSON report here (judge: also after each proposal)')

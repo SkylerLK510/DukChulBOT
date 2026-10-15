@@ -1,9 +1,10 @@
 # Scale trap: results (2026-10-15)
 
 **Setup.**
-- **Judge.** The cmd judge, with 5 samples per proposal: Claude Sonnet 5.5 (`--judge-cmd claude`) and Codex gpt-6.1-sol (`--judge-cmd codex`).
+- **Judge.** The cmd judge, with 5 samples per proposal: `--judge-cmd claude` and `--judge-cmd codex`. The reports record only the command. In the same day's isolation checks they resolved to Claude Sonnet 5.5 and Codex gpt-6.1-sol.
 - **Pre-registration.** Expectations are in [EXPECTED.md](EXPECTED.md) and [holdout/PREREG.md](holdout/PREREG.md), each written before its runs.
 - **Raw reports** are in `design-council-research/judge-oct15/`, outside this repo.
+- **Builds and aggregation.** The runs used plain sample shares and builds of `council.py` from earlier the same day. A later review rebuilt every prompt byte-identically and replayed every total and verdict from the stored picks. The judge now shrinks shares toward an even split, which rescales every score the same way and keeps these rankings.
 
 ## The checkpoint case (written with the headroom question; same author)
 
@@ -28,10 +29,10 @@ Totals are listed highest first, and the trap is in bold.
 | E4: trap p < 0.5 on the 200-worker constraint | | | pass | pass | | |
 | E5: trap below named-ceiling on headroom | | | | | pass | pass |
 
-**What the A runs show.** The prediction for run A held: with growth stated only in the context, both judges ranked the trap second and credited it with meeting the 30-minute constraint. Each run escalated only because the trap trailed by less than `min_margin`. The independent P(flip) was 0.39 for Claude and 0.38 for Codex.
+**What the A runs show.** The prediction for run A held: with growth stated only in the context, both judges ranked the trap second. They credited it with meeting the 30-minute constraint: Claude unanimously (p = 1.00), and Codex 3 samples to 2 (p = 0.60). Each run escalated only because the trap trailed by less than `min_margin`. The independent P(flip) was 0.39 for Claude and 0.38 for Codex.
 
 **A flaw in this probe.**
-- **What happened.** The two good proposals never restate the brief's "no paid services" constraint, and the default rubric counts silence as "not addressed". So the judges gave them p = 0.00 to 0.60 there, against 1.00 for the trap, which says it "adds no new service".
+- **What happened.** The two good proposals never restate the brief's "no paid services" constraint, and the default rubric counts silence as "not addressed". So the judges gave `buddy-replication.md` 0.20 to 0.60 there, and `named-ceiling.md` 0.00 to 1.00, against 1.00 for the trap, which says it "adds no new service".
 - **Its effect.** It costs `buddy-replication.md` about 0.04 of its total, which is why it trails the trap in run B with Codex (E2 fails by 0.007), and part of why it trails in run A.
 - **Why the file stays.** It was pre-registered, so it is left unedited.
 - **The clean test** is the holdout below, which an independent author wrote.
@@ -57,12 +58,19 @@ All four runs escalate, because the two good proposals are within `min_margin` o
 1. **The blind spot is real but depends on the case.**
    - **Caught:** when the constraint that breaks is itself a number the judge can check, such as a deadline or a throughput figure, the judges did the arithmetic.
    - **Missed:** when the breakage is indirect (bandwidth to backlog to stale resume points), neither judge connected the growth in the context to the constraint.
-2. **Stating the load as a hard constraint fixed it with both judges** (run B: p = 0.00 on the scale constraint). This costs nothing. It is now step 1 of [PROTOCOL.md](../../../PROTOCOL.md).
-3. **The headroom question worked in all 4 runs where it was asked, on two cases by two authors and with two judges.**
+2. **Stating the load as a hard constraint made both judges see it** (run B: p = 0.00 on the scale constraint).
+   - **The ordering.** It corrected the full ordering for Claude only. Codex still put the trap 0.007 above `buddy-replication.md`, inside the cost of the probe's flaw.
+   - **Adoption.** It costs nothing, so it is now step 1 of [PROTOCOL.md](../../../PROTOCOL.md).
+3. **The added headroom question put the trap last in all 4 judge-and-case evaluations of a trap:** two cases by two authors, each with two judges. This is a smoke test of an added scored dimension, not proof that operational wording is what works.
+   - **It works through its own weight.** Remove that weight from run C's saved answers and the trap is back above `buddy-replication.md` for both judges.
+   - **It can move other answers.** In one holdout run (H, Claude), adding it moved the trap's answer on the 55 s constraint from 0.00 to 0.60, the wrong way. All questions share one prompt, so an added question can change how the judge answers the others.
    - It gave the trap 0.00 every time.
    - It credited the stated ceiling (named-ceiling 0.67 and ceiling 1.00, against 0.00 for the trap).
-   - On the worked example in `examples/coordinator-host`, whose brief states no growth, it left the ranking, the vetoes and the verdict unchanged. When every proposal gets the same headroom score it shrinks margins by 13% (its weight, 0.15, against a total weight of 1.15).
+   - It was also asked in 2 runs of the worked example in `examples/coordinator-host`, whose brief states no growth: 6 runs in all.
+     - **No change in outcome.** The ranking, the vetoes and the verdict were unchanged with both judges (margin 0.251 against 0.283 for Claude, 0.169 against 0.201 for Codex).
+     - **But not neutral.** The question's top level applies when the brief states no growth. Codex picked it for every proposal, but Claude chose level 1 in 16 of 25 samples (on both decoys, `wsl2.md`, and one sample of `native-windows.md`). There it acted as a second quality signal. When every proposal gets the same headroom score it shrinks margins by 13% (its weight, 0.15, against a total weight of 1.15).
 4. **Not shown.**
    - **Calibration.** Two cases are a smoke test, not a rate.
    - **Overfitting.** The headroom question was written by the author of the first case.
    - **Coverage.** No case yet has the breaking load stated only in a proposal, nor growth with no number.
+   - **Neutrality.** Claude does not reliably apply the question's escape clause on a brief with no growth (see 3).
