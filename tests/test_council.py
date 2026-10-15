@@ -31,13 +31,6 @@ def rubric():
     return c.load_rubric(c.DEFAULT_RUBRIC)
 
 
-V1_RUBRIC = ROOT / 'rubrics' / 'system_design.v1.json'  # the questions the saved live run was asked
-
-
-def rubric_v1():
-    return c.load_rubric(V1_RUBRIC)
-
-
 def score_rubric():
     """The default rubric with per-constraint dimensions turned back into plain Scores,
     so the chairman tests can drive every dimension with one number."""
@@ -189,8 +182,8 @@ class RubricTests(unittest.TestCase):
 
     def test_nan_and_infinite_values_never_load(self):
         text = c.DEFAULT_RUBRIC.read_text()
-        for bad in (text.replace('"weight": 0.17,', '"weight": NaN,', 1),
-                    text.replace('"weight": 0.17,', '"weight": Infinity,', 1),
+        for bad in (text.replace('"weight": 0.2,', '"weight": NaN,', 1),
+                    text.replace('"weight": 0.2,', '"weight": Infinity,', 1),
                     text.replace('"threshold": 0.7,', '"threshold": NaN,', 1)):
             self.assertNotEqual(bad, text)
             with mock.patch.object(Path, 'read_text', return_value=bad), self.assertRaises(ValueError):
@@ -950,8 +943,8 @@ class MandatoryTests(unittest.TestCase):
 
     def test_rescore_applies_mandatory_to_the_operative_gate(self):
         live = json.loads((EXAMPLE / 'live-run.jev-1.13.0.json').read_text())
-        plain = c.rescore(live, rubric_v1())
-        strict = c.rescore(live, rubric_v1(), mandatory=[6])
+        plain = c.rescore(live, rubric())
+        strict = c.rescore(live, rubric(), mandatory=[6])
         self.assertEqual(strict['decision']['recommendation'], plain['decision']['recommendation'])
         self.assertTrue(set(plain['decision']['reasons']) <= set(strict['decision']['reasons']))
         self.assertIn('mandatory constraint 6', ' '.join(strict['decision']['reasons']))
@@ -962,7 +955,7 @@ class ShadowGateTests(unittest.TestCase):
     LIVE = EXAMPLE / 'live-run.jev-1.13.0.json'
 
     def live(self, mandatory=None):
-        return c.rescore(json.loads(self.LIVE.read_text(encoding='utf-8')), rubric_v1(), mandatory)
+        return c.rescore(json.loads(self.LIVE.read_text(encoding='utf-8')), rubric(), mandatory)
 
     def run_council(self, by_text, rub=None):
         return PolicyTests.run_council(self, by_text, rub)
@@ -1029,11 +1022,11 @@ class ShadowGateTests(unittest.TestCase):
         for row in report['judged']:
             for answer in row['answers'].values():
                 answer.pop('confidence', None)
-        ranking = c.rescore(report, rubric_v1())['shadow']['ranking']
+        ranking = c.rescore(report, rubric())['shadow']['ranking']
         self.assertAlmostEqual(ranking['p_flip'], 0.069923845, places=8)
 
     def test_a_flip_probability_above_max_flip_escalates_the_shadow_gate(self):
-        r = rubric_v1()
+        r = rubric()
         r['decision']['max_flip'] = 0.05
         shadow = c.rescore(json.loads(self.LIVE.read_text(encoding='utf-8')), r)['shadow']
         self.assertEqual(shadow['action'], 'escalate')
@@ -1163,7 +1156,7 @@ class CheckpointAndJournalTests(unittest.TestCase):
 
     def test_the_verdict_prints_even_if_the_journal_cannot_be_written(self):
         out, err = io.StringIO(), io.StringIO()
-        args = ['rescore', '--report', str(EXAMPLE / 'live-run.jev-1.13.0.json'), '--rubric', str(V1_RUBRIC),
+        args = ['rescore', '--report', str(EXAMPLE / 'live-run.jev-1.13.0.json'), '--rubric', str(c.DEFAULT_RUBRIC),
                 '--out', str(self.dir / 'r.json'), '--journal', str(self.dir / 'missing-dir' / 'j.jsonl')]
         with mock.patch.object(c.sys, 'stderr', err):
             self.assertEqual(c.main(args, out=out), 2)
@@ -1171,7 +1164,7 @@ class CheckpointAndJournalTests(unittest.TestCase):
 
     def test_journal_label_and_validate(self):
         report, journal = self.dir / 'r.json', self.dir / 'decisions.jsonl'
-        args = ['rescore', '--report', str(EXAMPLE / 'live-run.jev-1.13.0.json'), '--rubric', str(V1_RUBRIC),
+        args = ['rescore', '--report', str(EXAMPLE / 'live-run.jev-1.13.0.json'), '--rubric', str(c.DEFAULT_RUBRIC),
                 '--out', str(report), '--journal', str(journal)]
         self.assertEqual(c.main(args, out=io.StringIO()), 1)
         self.assertEqual(c.main(['label', '--journal', str(journal), '--brief', str(EXAMPLE / 'brief.md'),
@@ -1307,7 +1300,7 @@ class CliTests(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.dict(c.os.environ, {}, clear=True), \
                 mock.patch.object(c.urllib.request, 'urlopen', side_effect=AssertionError('no network allowed')):
-            code = c.main(['rescore', '--report', saved, '--rubric', str(V1_RUBRIC)], out=out)
+            code = c.main(['rescore', '--report', saved, '--rubric', str(c.DEFAULT_RUBRIC)], out=out)
         report = json.loads(Path(saved).read_text(encoding='utf-8'))
         self.assertEqual(code, 0 if report['decision']['action'] == 'recommend' else 1)
         self.assertIn('model: jev-1.13.0', out.getvalue())
@@ -1348,7 +1341,7 @@ class CliTests(unittest.TestCase):
 
     def test_golden_render_of_the_saved_live_run(self):
         out = io.StringIO()
-        c.main(['rescore', '--report', str(EXAMPLE / 'live-run.jev-1.13.0.json'), '--rubric', str(V1_RUBRIC)], out=out)
+        c.main(['rescore', '--report', str(EXAMPLE / 'live-run.jev-1.13.0.json'), '--rubric', str(c.DEFAULT_RUBRIC)], out=out)
         self.assertEqual(out.getvalue(), (ROOT / 'tests' / 'golden' / 'live-run.rescore.txt').read_text(encoding='utf-8'))
 
     def test_validate_keeps_judge_configurations_apart(self):
