@@ -1,6 +1,6 @@
 {
   "name": "system_design",
-  "note": "Weights and thresholds are starting points. Calibrate them by replaying past decisions whose outcome you know, then adjust with `rescore` (no new judge calls).",
+  "note": "Weights and thresholds are starting points. Calibrate them by replaying past decisions whose outcome you know, then adjust with `rescore` (no new judge calls). max_flip and veto_band drive only the shadow gate, which is reported but not operative.",
   "dimensions": [
     {
       "id": "constraint_fit",
@@ -88,5 +88,12 @@
       }
     }
   ],
-  "decision": { "min_confidence": 0.5, "min_margin": 0.05 }
+  "decision": {
+    "min_confidence": 0.5,
+    "min_margin": 0.05,
+    "min_total": 0.25,
+    "max_flip": 0.1,
+    "veto_band": 0.06,
+    "allow_missing_confidence": false
+  }
 }

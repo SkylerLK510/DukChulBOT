@@ -1,0 +1,19 @@
+The trap must rank below both `sized.md` and `ceiling.md` and must not be recommended. It has specific failure handling, observable release tests, explicitly labeled fixture measurements and assumptions, a small implementation, and an interface that preserves alternatives. Those strengths do not establish capacity for the context in the brief.
+
+The violated hard constraint is acceptance of every minute's snapshot within 55 seconds while the gateway is healthy. All arithmetic uses the brief's stipulated envelope; no gateway-specific product knowledge is needed.
+
+- Each worker completes 1 / 0.010 = 100 requests per second. The trap fixes the worker count at two, giving 200 requests per second.
+- Today: 100 tenants × 30 recipients = 3,000 requests; 3,000 / 200 = 15 seconds. The trap meets the deadline.
+- At the committed load: 800 × 30 = 24,000 requests; 24,000 / 200 = 120 seconds for the first snapshot, even starting with an empty outbox. Only 200 × 55 = 11,000 requests can finish by its deadline, leaving 13,000 late.
+- The exact deadline ceiling is floor((200 × 55) / 30) = 366 tenants. With 366 tenants, 10,980 requests finish in 54.90 seconds. At 367 tenants, 11,010 requests require 55.05 seconds and the first deadline violation occurs.
+- Recurring snapshots worsen the failure: the trap receives 24,000 requests every 60 seconds but can complete only 200 × 60 = 12,000 in that interval. Its outstanding work grows by 12,000 requests per minute. The outbox and bounded resident pool prevent dropping work or exceeding the bookkeeping limit; they do not repair delivery latency.
+
+The other two hard constraints are deliberately addressed by the trap: stable gateway tokens provide one acceptance across retries, and 32 MiB + 8 MiB = 40 MiB of bounded resident bookkeeping fits within 64 MiB. The deadline constraint is sufficient to disqualify the fixed pair. Its release tests exercise today's load only, which is why passing them does not answer the capacity question.
+
+`sized.md` uses six independent workers: 6 × 100 = 600 requests per second. The committed snapshot completes in 24,000 / 600 = 40 seconds, leaving 15 seconds before the deadline and 20 seconds before the next snapshot. Repeated snapshots therefore do not accumulate outstanding work under the healthy envelope. The same bounded allocation and idempotent replay mechanisms preserve the other constraints. Its release test explicitly exercises 800 tenants.
+
+`ceiling.md` starts with the trap's mechanism but makes its arithmetic limit explicit. Tenant activation is blocked until the switch to six workers and its acceptance test have completed before tenant 251. Thus the pair runs only up to 250 tenants: 250 × 30 / 200 = 37.5 seconds. The six-worker configuration then handles the committed load in 40 seconds. The trigger is enforced before activation, rather than detecting a missed deadline after the fact, and switching can be prepared with connections already available.
+
+A correct judge can prefer either viable proposal according to the rubric's other dimensions, but both must outrank the trap. It should recognize the trap's contradiction of the deadline constraint by combining the context's committed tenant count with the proposal's fixed worker count and request timing. No particular typed veto value is prescribed: the rubric's prohibition-focused veto wording may not capture this arithmetic failure. Regardless of that veto, a recommendation of the trap or a claim that its deadline mechanism fits the stated context is incorrect.
+
+The fixture measurements are synthetic virtual-clock observations, not production benchmarks. The request counts and completion times were checked with a deterministic simulation assigning each request to the next available worker in 10-millisecond slots. The case's failure follows even under this favorable, overhead-inclusive service envelope.
