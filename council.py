@@ -20,9 +20,14 @@ printed or written. `show-request` prints exactly what would leave the machine.
 from __future__ import annotations
 
 import argparse
+import bisect
+import datetime
 import hashlib
+import http.client
 import json
+import math
 import os
+import platform
 import random
 import re
 import string
@@ -30,46 +35,109 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import defaultdict
+from itertools import accumulate
 from pathlib import Path
 
-SCHEMA_VERSION = 2  # 2: reports keep the brief's parsed hard constraints
+SCHEMA_VERSION = 3  # 3: provenance, checkpoints, mandatory constraints, the shadow gate; 2: parsed constraints
 TYPESAFE_URL = 'https://api.typesafe.ai/v1/systemone'
 DEFAULT_MODEL = 'jev-latest'
 DEFAULT_RUBRIC = Path(__file__).parent / 'rubrics' / 'system_design.json'
-RETRYABLE = (429, 529)  # documented: back off and retry
+TOOL_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+# Retry what TypeSafe's own SDK retries (RetryPolicy defaults): 408, 429 and every 5xx,
+# plus connection errors and timeouts. A duplicate POST costs about $0.0001.
+RETRYABLE = frozenset({408, 429, *range(500, 600)})
+FATAL = (401, 403)  # the key is refused: every later request would be too
+MAX_BODY = 4 * 1024 * 1024  # bytes read from any response
+# Decision rules, their defaults and their ranges. Every value is a starting point, not a
+# finding: min_total, max_flip and veto_band in particular are uncalibrated placeholders.
+DECISION_RULES = (('min_confidence', 0.5), ('min_margin', 0.05), ('min_total', 0.25),
+                  ('max_flip', 0.10), ('veto_band', 0.06))
 
 
 class JudgeError(Exception):
-    """The judge could not answer. Carries a message that is safe to store."""
+    """The judge could not answer. Carries a message that is safe to store, and `fatal`
+    when no later request can succeed either (a refused key), so the run stops."""
+
+    def __init__(self, message, fatal=False):
+        super().__init__(message)
+        self.fatal = fatal
 
 
-def retry_delay_s(headers, attempt):
-    """The server's numeric Retry-After when it sends one (capped at a minute),
-    otherwise exponential backoff. A date-valued or missing header falls back."""
+def _no_constant(name):
+    raise ValueError(f'{name} is not a JSON number')
+
+
+def loads(text):
+    """json.loads that refuses NaN and Infinity. Python accepts them by default, and a
+    NaN slips past every threshold (NaN >= 0.7 is False, so a NaN veto never fires)."""
+    return json.loads(text, parse_constant=_no_constant)
+
+
+def is_number(x, lo=-math.inf, hi=math.inf):
+    """A finite int or float in [lo, hi]. bool is excluded: True would pass as 1."""
+    return type(x) in (int, float) and math.isfinite(x) and lo <= x <= hi
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+
+
+def retry_delay_s(headers, attempt, rand=random.random):
+    """The server's numeric Retry-After when it sends one, otherwise TypeSafe's SDK
+    backoff: 0.5 s doubling to at most 5 s, with up to a quarter randomly taken off so
+    retries spread out. A date-valued or missing header falls back. The caller's
+    deadline caps both."""
     try:
         seconds = float((headers or {}).get('Retry-After'))
     except (TypeError, ValueError):
         seconds = float('nan')
     if seconds >= 0:  # False for NaN
-        return min(seconds, 60.0)
-    return min(2 ** attempt, 30)
+        return seconds
+    return min(0.5 * 2 ** (attempt - 1), 5.0) * (1 - 0.25 * rand())
+
+
+def error_detail(exc, secret=None):
+    """A short one-line excerpt of an HTTP error body, read BEFORE the error is closed
+    (a TypeSafe 422 names the offending field there; an Ollama 404 names the missing
+    model), with the key scrubbed in case a server echoes it."""
+    try:
+        text = exc.read(2048).decode('utf-8', 'replace')
+    except (OSError, ValueError, AttributeError, http.client.HTTPException):
+        text = ''
+    finally:
+        exc.close()
+    text = ' '.join(text.split())[:300]
+    if secret:
+        text = text.replace(secret, '***')
+    return f': {text}' if text else ''
 
 
 # --- rubric -------------------------------------------------------------------------
 
 def load_rubric(path):
     """A dimension is either a Score (`instructions` + `levels`) or `per_constraint`: one
-    Noul per hard constraint listed in the brief, combined in code."""
-    rubric = json.loads(Path(path).read_text(encoding='utf-8'))
+    Noul per hard constraint listed in the brief, combined in code. Every value is
+    checked before anything is judged or rescored: a NaN weight would otherwise give a
+    NaN total that still gets recommended."""
+    rubric = loads(Path(path).read_text(encoding='utf-8'))
+    if not isinstance(rubric, dict):
+        raise ValueError('a rubric is a JSON object')
     dims, vetoes = rubric.get('dimensions') or [], rubric.get('vetoes') or []
+    if not isinstance(dims, list) or not isinstance(vetoes, list) or not all(isinstance(x, dict) for x in dims + vetoes):
+        raise ValueError('dimensions and vetoes must be lists of objects')
     if not dims:
         raise ValueError('rubric needs at least one dimension')
     ids = [d.get('id') for d in dims] + [v.get('id') for v in vetoes]
     if len(set(ids)) != len(ids) or not all(isinstance(i, str) and i and '.' not in i for i in ids):
         raise ValueError('dimension and veto ids must be unique non-empty strings without dots')
     for d in dims:
-        if not isinstance(d.get('weight'), (int, float)) or d['weight'] <= 0:
-            raise ValueError(f"{d['id']}: weight must be a positive number")
+        if not is_number(d.get('weight')) or d['weight'] <= 0:
+            raise ValueError(f"{d['id']}: weight must be a positive finite number")
         if 'per_constraint' in d:
             if 'levels' in d:
                 raise ValueError(f"{d['id']}: use either levels or per_constraint, not both")
@@ -77,16 +145,23 @@ def load_rubric(path):
             if not isinstance(question, str) or '`constraint`' not in question:
                 raise ValueError(f"{d['id']}: per_constraint needs a question that refers to `constraint`")
             continue
-        if not 2 <= len(d.get('levels') or []) <= 10:
-            raise ValueError(f"{d['id']}: a Score takes 2 to 10 levels")
+        levels = d.get('levels')
+        if not isinstance(levels, list) or not 2 <= len(levels) <= 10 or not all(isinstance(x, str) and x for x in levels):
+            raise ValueError(f"{d['id']}: a Score takes 2 to 10 levels, each a non-empty string")
         if not d.get('instructions'):
             raise ValueError(f"{d['id']}: instructions are required")
     for v in vetoes:
-        if not v.get('instructions') or not 0 < v.get('threshold', 0) <= 1:
-            raise ValueError(f"{v.get('id')}: veto needs instructions and a threshold in (0, 1]")
+        if not v.get('instructions') or not is_number(v.get('threshold'), 0, 1) or v['threshold'] == 0:
+            raise ValueError(f"{v['id']}: veto needs instructions and a threshold in (0, 1]")
     decision = rubric.setdefault('decision', {})
-    decision.setdefault('min_confidence', 0.5)
-    decision.setdefault('min_margin', 0.05)
+    if not isinstance(decision, dict):
+        raise ValueError('decision must be an object')
+    for key, default in DECISION_RULES:
+        decision.setdefault(key, default)
+        if not is_number(decision[key], 0, 1):
+            raise ValueError(f'decision.{key} must be a number from 0 to 1')
+    if type(decision.setdefault('allow_missing_confidence', False)) is not bool:
+        raise ValueError('decision.allow_missing_confidence must be true or false')
     return rubric
 
 
@@ -94,6 +169,7 @@ HEADING = re.compile(r'^\s{0,3}(?:#{1,6}\s*)?[*_]{0,2}\s*hard\s+constraints?\s*(
                      r'\s*[*_]{0,2}\s*#*\s*$', re.IGNORECASE)
 BULLET = re.compile(r'^(\s*)(?:[-*+]|\d+[.)])\s+(.*\S)\s*$')
 THEMATIC_BREAK = re.compile(r'^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$')
+FENCE = re.compile(r'^\s*(`{3,}|~{3,})')
 
 
 def parse_constraints(brief):
@@ -101,10 +177,23 @@ def parse_constraints(brief):
     read the way Markdown reads a list. Text between the heading and the first bullet is
     skipped. A line straight under a bullet continues it, indented or not; a bullet
     indented deeper than the list folds into the one above; blank lines between bullets
-    are fine. After a blank line an unindented line ends the list, and so does a heading
-    or a horizontal rule. No such section gives []."""
-    constraints, inside, indent, after_blank = [], False, None, False
-    for line in brief.splitlines():
+    are fine. After a blank line an unindented line ends the list, and so does a heading,
+    a horizontal rule or an unindented code fence. Nothing inside a code fence counts,
+    so a brief can quote an example. No such section gives []."""
+    constraints, inside, indent, after_blank, fence = [], False, None, False, None
+    # CommonMark's line endings only: str.splitlines also splits on U+2028, U+001E and others.
+    for line in re.split(r'\r\n|\r|\n', brief):
+        opener = FENCE.match(line)
+        if fence:
+            if opener and opener.group(1)[0] == fence[0] and len(opener.group(1)) >= len(fence) \
+                    and not line[opener.end():].strip():
+                fence = None
+            continue
+        if opener:
+            fence = opener.group(1)
+            if inside and indent is not None and not line[:1].isspace():
+                inside = False
+            continue
         if HEADING.match(line):
             inside, indent, after_blank = True, None, False
             continue
@@ -171,14 +260,15 @@ def build_request(brief, proposal, rubric, model=DEFAULT_MODEL):
 # --- anonymisation ------------------------------------------------------------------
 
 def anonymise(proposals, seed=0):
-    """[(source_name, text)] -> [{'label','source','text'}], shuffled. The judge sees
-    only the text; the label-to-source map stays in the report for the human."""
+    """[(source_name, text[, path])] -> [{'label','source','text'[,'path']}], shuffled.
+    The judge sees only the text; the label-to-source map stays in the report."""
     if len(proposals) > len(string.ascii_uppercase):
         raise ValueError('at most 26 proposals')
     order = list(proposals)
     random.Random(seed).shuffle(order)
-    return [{'label': f'Proposal {string.ascii_uppercase[i]}', 'source': name, 'text': text}
-            for i, (name, text) in enumerate(order)]
+    return [{'label': f'Proposal {string.ascii_uppercase[i]}', 'source': name, 'text': text,
+             **({'path': path[0]} if path else {})}
+            for i, (name, text, *path) in enumerate(order)]
 
 
 # --- judges -------------------------------------------------------------------------
@@ -186,37 +276,61 @@ def anonymise(proposals, seed=0):
 class TypeSafeJudge:
     name = 'typesafe'
 
-    def __init__(self, api_key=None, url=TYPESAFE_URL, model=DEFAULT_MODEL, timeout_s=60.0,
-                 max_attempts=4, opener=urllib.request.urlopen, sleep=time.sleep):
+    def __init__(self, api_key=None, url=TYPESAFE_URL, model=DEFAULT_MODEL, timeout_s=30.0, deadline_s=60.0,
+                 max_attempts=3, opener=urllib.request.urlopen, sleep=time.sleep, clock=time.monotonic,
+                 rand=random.random):
         self.api_key = api_key or os.environ.get('TYPESAFE_API_KEY')
         if not self.api_key:
             raise JudgeError('TYPESAFE_API_KEY is not set')
-        self.url, self.model, self.timeout_s = url, model, timeout_s
-        self.max_attempts, self.opener, self.sleep = max_attempts, opener, sleep
+        if type(max_attempts) is not int or max_attempts < 1 or not is_number(timeout_s) or timeout_s <= 0 \
+                or not is_number(deadline_s) or deadline_s <= 0:
+            raise ValueError('max_attempts must be at least 1, and timeout_s and deadline_s positive')
+        self.url, self.model, self.timeout_s, self.deadline_s = url, model, timeout_s, deadline_s
+        self.max_attempts, self.opener, self.sleep, self.clock, self.rand = max_attempts, opener, sleep, clock, rand
+        self.info = {'url': url, 'requested_model': model, 'timeout_s': timeout_s, 'deadline_s': deadline_s,
+                     'max_attempts': max_attempts}
 
     def judge(self, brief, proposal, rubric):
+        """One proposal, every question in one request. Transient failures are retried
+        within one deadline that covers attempts, waits and reads; urllib's own timeout
+        is per blocking operation, so each one gets only the time that is left."""
         body = json.dumps(build_request(brief, proposal, rubric, self.model)).encode()
         request = urllib.request.Request(self.url, data=body, method='POST', headers={
             'Authorization': f'Bearer {self.api_key}', 'Content-Type': 'application/json'})
+        deadline, payload, attempt = self.clock() + self.deadline_s, None, 0
         for attempt in range(1, self.max_attempts + 1):
+            # ceiling: a server that trickles bytes inside each timeout can still overrun the deadline
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                raise JudgeError(f'TypeSafe API gave no answer within {self.deadline_s:g} s')
             try:
-                with self.opener(request, timeout=self.timeout_s) as response:
-                    payload = json.loads(response.read())
+                with self.opener(request, timeout=min(self.timeout_s, remaining)) as response:
+                    raw = response.read(MAX_BODY + 1)
+                if len(raw) > MAX_BODY:
+                    raise JudgeError('TypeSafe response is larger than 4 MiB')
+                payload = loads(raw)
                 break
-            except urllib.error.HTTPError as exc:
-                exc.close()
-                if exc.code in RETRYABLE and attempt < self.max_attempts:
-                    self.sleep(retry_delay_s(exc.headers, attempt))
-                    continue
-                raise JudgeError(f'TypeSafe API returned HTTP {exc.code}') from None
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                raise JudgeError(f'TypeSafe API unreachable: {type(exc).__name__}') from None
-            except json.JSONDecodeError:
-                raise JudgeError('TypeSafe API returned a body that is not JSON') from None
-        answers = payload.get('answers') if isinstance(payload, dict) else None
-        if not isinstance(answers, dict):
+            except urllib.error.HTTPError as exc:  # before URLError and OSError, which it subclasses
+                failure = f'TypeSafe API returned HTTP {exc.code}{error_detail(exc, self.api_key)}'
+                if exc.code in FATAL:
+                    raise JudgeError(failure, fatal=True) from None
+                if exc.code not in RETRYABLE or attempt == self.max_attempts:
+                    raise JudgeError(failure) from None
+                delay = retry_delay_s(exc.headers, attempt, self.rand)
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+                failure = f'TypeSafe API unreachable: {type(exc).__name__}'
+                if attempt == self.max_attempts:
+                    raise JudgeError(failure) from None
+                delay = retry_delay_s(None, attempt, self.rand)
+            except ValueError:  # bad JSON, bad UTF-8, NaN
+                raise JudgeError('TypeSafe API returned a body that is not valid JSON') from None
+            if self.clock() + delay >= deadline:
+                raise JudgeError(f'{failure}; waiting {delay:g} s to retry would pass the {self.deadline_s:g} s deadline')
+            self.sleep(delay)
+        if not isinstance(payload, dict) or not isinstance(payload.get('answers'), dict):
             raise JudgeError('TypeSafe response has no answers map')
-        return {'answers': answers, 'model': payload.get('model'), 'usage': payload.get('usage')}
+        return {'answers': payload['answers'], 'model': payload.get('model'), 'usage': payload.get('usage'),
+                'request_sha256': sha256(body), 'attempts': attempt}
 
 
 def describe(instructions):
@@ -230,14 +344,18 @@ def describe(instructions):
 class OllamaJudge:
     """Offline stand-in so the pipeline runs with no key and nothing leaving the machine.
     An LLM forced to a JSON schema picks one level per Score and true or false per Noul:
-    no probability distribution, so every answer carries confidence None and the
-    confidence gate reports 'unavailable'. Use it to check plumbing and as a second
+    no probability distribution, so every answer carries confidence None, the confidence
+    gate escalates unless the run allows missing confidence, and the shadow gate reports
+    ranking uncertainty as unavailable. Use it to check plumbing and as a second
     opinion, not as a calibrated judge."""
     name = 'ollama'
 
     def __init__(self, url='http://localhost:11434', model='qwen2.5:7b', timeout_s=300.0,
                  opener=urllib.request.urlopen):
+        if not re.match(r'https?://', url):
+            raise ValueError('the Ollama URL must start with http:// or https://')
         self.url, self.model, self.timeout_s, self.opener = url.rstrip('/'), model, timeout_s, opener
+        self.info = {'url': self.url, 'requested_model': model, 'timeout_s': timeout_s}
 
     def judge(self, brief, proposal, rubric):
         questions, props, lines = build_questions(rubric, parse_constraints(brief)), {}, []
@@ -263,45 +381,97 @@ class OllamaJudge:
                                          headers={'Content-Type': 'application/json'})
         try:
             with self.opener(request, timeout=self.timeout_s) as response:
-                picked = json.loads(json.loads(response.read())['message']['content'])
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raw = response.read(MAX_BODY + 1)
+            if len(raw) > MAX_BODY:
+                raise JudgeError('Ollama reply is larger than 4 MiB')
+            picked = loads(loads(raw)['message']['content'])
+        except urllib.error.HTTPError as exc:  # a 404 means the model is not pulled
+            raise JudgeError(f'Ollama returned HTTP {exc.code}{error_detail(exc)}') from None
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
             raise JudgeError(f'Ollama unreachable: {type(exc).__name__}') from None
-        except (KeyError, TypeError, json.JSONDecodeError):
+        except (KeyError, TypeError, ValueError):
             raise JudgeError('Ollama reply was not the requested JSON') from None
+        if not isinstance(picked, dict):
+            raise JudgeError('Ollama reply was not the requested JSON object')
         answers = {}
         for qid, q in questions.items():
+            value = picked.get(qid)
             if q['type'] == 'noul':
-                answers[qid] = {'type': 'noul', 'noul': 1.0 if picked.get(qid) is True else 0.0, 'confidence': None}
+                # Never read an omitted answer as false: for a veto, false lets the proposal through.
+                if type(value) is not bool:
+                    raise JudgeError(f'Ollama gave no true/false answer for {qid}')
+                answers[qid] = {'type': 'noul', 'noul': float(value), 'confidence': None}
                 continue
-            level, top = picked.get(qid), len(q['criteria']) - 1
-            if type(level) is not int or not 0 <= level <= top:
-                raise JudgeError(f"Ollama gave no valid level for {qid}")
-            answers[qid] = {'type': 'score', 'score': float(level), 'confidence': None,
-                            'probabilities': {str(i): float(i == level) for i in range(top + 1)}}
-        return {'answers': answers, 'model': f'ollama:{self.model}', 'usage': None}
+            top = len(q['criteria']) - 1
+            if type(value) is not int or not 0 <= value <= top:
+                raise JudgeError(f'Ollama gave no valid level for {qid}')
+            answers[qid] = {'type': 'score', 'score': float(value), 'confidence': None,
+                            'probabilities': {str(i): float(i == value) for i in range(top + 1)}}
+        return {'answers': answers, 'model': f'ollama:{self.model}', 'usage': None,
+                'request_sha256': sha256(body), 'attempts': 1}
 
 
 # --- the chairman is code -----------------------------------------------------------
 
-def judge_all(brief, anonymised, rubric, judge):
+def judge_all(brief, anonymised, rubric, judge, on_row=None):
+    """Judge every proposal in turn. Each finished row is passed to `on_row` (the CLI
+    writes a checkpoint), so a crash keeps the answers already given. A fatal judge
+    error (a refused key) stops the run instead of sending every remaining proposal."""
     rows = []
     for item in anonymised:
-        row = {'label': item['label'], 'source': item['source']}
+        row = {'label': item['label'], 'source': item['source'], **({'path': item['path']} if 'path' in item else {}),
+               'proposal_sha256': sha256(item['text'].encode())}
+        started = time.monotonic()
         try:
             row.update(judge.judge(brief, item['text'], rubric))
         except JudgeError as exc:
+            if exc.fatal:
+                raise
             row['error'] = str(exc)
+        row['elapsed_s'] = round(time.monotonic() - started, 3)
         rows.append(row)
+        if on_row:
+            on_row(rows)
     return rows
 
 
+def check_score(answer, top):
+    """What is wrong with a Score answer over levels 0..top, or None. It errors rather
+    than repairs: a clamped 999 or a missing distribution would otherwise reach the
+    totals and the shadow gate looking normal."""
+    if not isinstance(answer, dict) or not is_number(answer.get('score')):
+        return 'no score'
+    if not 0 <= answer['score'] <= top:
+        return f"score {answer['score']} outside 0..{top}"
+    probs = answer.get('probabilities')
+    if not isinstance(probs, dict) or set(probs) != {str(i) for i in range(top + 1)} \
+            or not all(is_number(p, 0, 1) for p in probs.values()):
+        return f'no probability per level 0..{top}'
+    if abs(sum(probs.values()) - 1) > 0.05:  # two-decimal rounding over 10 levels stays within this
+        return 'probabilities that do not sum to 1'
+    if abs(sum(int(k) * p for k, p in probs.items()) - answer['score']) > 0.25:
+        return 'a score that does not match its probabilities'
+    if answer.get('confidence') is not None and not is_number(answer['confidence'], 0, 1):
+        return 'a confidence outside 0..1'
+    return None
+
+
+def check_noul(answer):
+    if not isinstance(answer, dict) or answer.get('noul') is None:
+        return 'no answer'
+    if not is_number(answer['noul'], 0, 1):
+        return 'a probability outside 0..1'
+    if answer.get('confidence') is not None and not is_number(answer['confidence'], 0, 1):
+        return 'a confidence outside 0..1'
+    return None
+
+
 def noul_confidence(answer):
-    """|2p - 1|: the peak-based confidence TypeSafe's docs illustrate for a Choice, applied
-    to a Noul's two outcomes. 0 at p = 0.5, 1 at p = 0 or 1. None when the judge says it
-    cannot report uncertainty."""
+    """|2p - 1|, TypeSafe's documented confidence for a Noul: 0 at p = 0.5, 1 at p = 0
+    or 1. None when the judge says it cannot report uncertainty."""
     if 'confidence' in answer and answer['confidence'] is None:
         return None
-    return round(abs(2 * answer['noul'] - 1), 4)
+    return abs(2 * answer['noul'] - 1)
 
 
 def score_per_constraint(d, answers, constraints, problems):
@@ -309,55 +479,59 @@ def score_per_constraint(d, answers, constraints, problems):
     so an unsure 0.5 counts half), with the least certain constraint as its confidence."""
     found = []
     for qid, text in zip(per_constraint_ids(d, constraints), constraints):
-        answer = answers.get(qid)
-        if not isinstance(answer, dict) or not isinstance(answer.get('noul'), (int, float)):
-            problems.append(f'no answer for {qid}')
+        problem = check_noul(answers.get(qid))
+        if problem:
+            problems.append(f'{problem} for {qid}')
         else:
-            found.append({'constraint': text, 'probability': answer['noul'], 'confidence': noul_confidence(answer)})
+            found.append({'constraint': text, 'probability': answers[qid]['noul'],
+                          'confidence': noul_confidence(answers[qid])})
     if not constraints:
         problems.append(f"{d['id']} needs the brief's hard constraints and there are none")
     if len(found) < len(constraints) or not constraints:
         return None
-    known = [c['confidence'] for c in found if c['confidence'] is not None]
-    return {'normalised': round(sum(c['probability'] for c in found) / len(found), 4),
-            'confidence': min(known) if known else None, 'constraints': found}
+    known = [c['confidence'] for c in found]
+    return {'normalised': sum(c['probability'] for c in found) / len(found),
+            'confidence': None if None in known else min(known), 'constraints': found}
 
 
 def score_row(row, rubric, constraints=()):
-    """One judged proposal -> normalised dimensions, weighted total, vetoes, confidence."""
+    """One judged proposal -> normalised dimensions, weighted total, vetoes, confidence.
+    Values keep full precision; only the printed report rounds."""
     if row.get('error'):
         return {'label': row['label'], 'source': row['source'], 'error': row['error']}
-    answers, total_weight = row['answers'], sum(d['weight'] for d in rubric['dimensions'])
-    dims, total, confidences, problems = {}, 0.0, [], []
+    answers, total_weight = row.get('answers'), sum(d['weight'] for d in rubric['dimensions'])
+    if not isinstance(answers, dict):
+        return {'label': row['label'], 'source': row['source'], 'error': 'no answers'}
+    dims, total, problems = {}, 0.0, []
     for d in rubric['dimensions']:
         if 'per_constraint' in d:
             dim = score_per_constraint(d, answers, constraints, problems)
             if dim is None:
                 continue
         else:
-            answer = answers.get(d['id'])
-            if not isinstance(answer, dict) or not isinstance(answer.get('score'), (int, float)):
-                problems.append(f"no score for {d['id']}")
+            top, answer = len(d['levels']) - 1, answers.get(d['id'])
+            problem = check_score(answer, top)
+            if problem:
+                problems.append(f"{problem} for {d['id']}")
                 continue
-            top = len(d['levels']) - 1
-            dim = {'normalised': round(min(max(answer['score'] / top, 0.0), 1.0), 4),
-                   'confidence': answer.get('confidence')}
+            dim = {'normalised': answer['score'] / top, 'confidence': answer.get('confidence')}
         dims[d['id']] = dim
         total += dim['normalised'] * d['weight'] / total_weight
-        if isinstance(dim['confidence'], (int, float)):
-            confidences.append((dim['confidence'], d['id']))
     vetoes = []
     for v in rubric.get('vetoes', []):
         answer = answers.get(v['id'])
-        if not isinstance(answer, dict) or not isinstance(answer.get('noul'), (int, float)):
-            problems.append(f"no answer for veto {v['id']}")
+        problem = check_noul(answer)
+        if problem:
+            problems.append(f"{problem} for veto {v['id']}")
         elif answer['noul'] >= v['threshold']:
             vetoes.append({'id': v['id'], 'probability': answer['noul'], 'threshold': v['threshold']})
     if problems:
         return {'label': row['label'], 'source': row['source'], 'error': '; '.join(problems)}
-    lowest = min(confidences, key=lambda c: c[0]) if confidences else (None, None)
-    return {'label': row['label'], 'source': row['source'], 'total': round(total, 4), 'dimensions': dims,
-            'vetoes': vetoes, 'min_confidence': lowest[0], 'min_confidence_at': lowest[1]}
+    known = [(dim['confidence'], k) for k, dim in dims.items() if dim['confidence'] is not None]
+    lowest = min(known, key=lambda c: c[0]) if known else (None, None)
+    return {'label': row['label'], 'source': row['source'], 'total': total, 'dimensions': dims, 'vetoes': vetoes,
+            'min_confidence': lowest[0], 'min_confidence_at': lowest[1],
+            'no_confidence': [k for k, dim in dims.items() if dim['confidence'] is None]}
 
 
 def decide(scored, rubric):
@@ -377,14 +551,22 @@ def decide(scored, rubric):
     if any(s.get('error') for s in scored):
         blockers.append('at least one proposal was not judged, so the comparison is incomplete')
     if len(eligible) > 1:
-        margin = round(winner['total'] - eligible[1]['total'], 4)
+        margin = winner['total'] - eligible[1]['total']
         if margin < rule['min_margin']:
-            blockers.append(f"{winner['label']} leads {eligible[1]['label']} by {margin}, below min_margin {rule['min_margin']}")
+            blockers.append(f"{winner['label']} leads {eligible[1]['label']} by {margin:.4f}, "
+                            f"below min_margin {rule['min_margin']}")
     else:
         margin = None
-    if winner['min_confidence'] is None:
-        reasons.append('this judge reports no confidence, so the confidence gate was not applied')
-    elif winner['min_confidence'] < rule['min_confidence']:
+    if winner['total'] < rule['min_total']:
+        blockers.append(f"{winner['label']} scores {winner['total']:.3f}, below the floor min_total {rule['min_total']}")
+    if winner['no_confidence']:
+        missing = f"the judge reported no confidence for {winner['label']} on {', '.join(winner['no_confidence'])}"
+        if rule['allow_missing_confidence']:
+            reasons.append(f'{missing}, so the confidence gate was not applied there (allow_missing_confidence)')
+        else:
+            blockers.append(f'{missing}, so the confidence gate cannot be applied '
+                            '(pass --allow-missing-confidence for an advisory run)')
+    if winner['min_confidence'] is not None and winner['min_confidence'] < rule['min_confidence']:
         at, detail = winner.get('min_confidence_at'), ''
         unclear = sorted((c for c in winner['dimensions'].get(at, {}).get('constraints', [])
                           if c['confidence'] is not None and c['confidence'] < rule['min_confidence']),
@@ -398,27 +580,265 @@ def decide(scored, rubric):
             'recommended_source': winner['source'], 'margin': margin, 'reasons': reasons + blockers}
 
 
-def build_report(brief, judged, rubric, judge_name, seed):
+# --- the shadow gate: reported next to the verdict, never in charge of it -----------
+
+def answer_distributions(row, rubric, constraints):
+    """A proposal's total as independent pieces, [(weight share, [(value, p), ...])]: one
+    per Score (its levels) and one per constraint question (0 or 1). Vetoes are held
+    fixed. None when the judge gave no real distribution (it reports no confidence)."""
+    total_weight, items = sum(d['weight'] for d in rubric['dimensions']), []
+    for d in rubric['dimensions']:
+        if 'per_constraint' in d:
+            for qid in per_constraint_ids(d, constraints):
+                answer = row['answers'][qid]
+                if noul_confidence(answer) is None:
+                    return None
+                items.append((d['weight'] / total_weight / len(constraints),
+                              [(0.0, 1 - answer['noul']), (1.0, answer['noul'])]))
+        else:
+            answer, top = row['answers'][d['id']], len(d['levels']) - 1
+            if answer.get('confidence') is None:
+                return None
+            mass = sum(answer['probabilities'].values())
+            items.append((d['weight'] / total_weight,
+                          [(int(k) / top, p / mass) for k, p in answer['probabilities'].items()]))
+    return items
+
+
+def total_distribution(items, together=False):
+    """The exact distribution of a proposal's total, as sorted [(total, p)]. Independent
+    answers are convolved. `together` is the stress case: every answer of the proposal
+    follows one shared draw, so they are all good or all bad at once."""
+    dist = defaultdict(float)
+    if not together:
+        dist[0.0] = 1.0
+        for weight, outcomes in items:
+            step = defaultdict(float)
+            for total, p in dist.items():
+                for value, q in outcomes:
+                    if q:
+                        step[round(total + weight * value, 9)] += p * q
+            dist = step
+        return sorted(dist.items())
+    ladders = []
+    for weight, outcomes in items:
+        outcomes = sorted(outcomes)
+        ladders.append((weight, [v for v, _ in outcomes], list(accumulate(q for _, q in outcomes))))
+    cuts = sorted({0.0, 1.0, *(min(max(c, 0.0), 1.0) for _, _, cdf in ladders for c in cdf)})
+    for a, b in zip(cuts, cuts[1:]):
+        u = (a + b) / 2  # between two cuts every answer sits on one outcome
+        total = sum(w * values[min(bisect.bisect_right(cdf, u), len(values) - 1)] for w, values, cdf in ladders)
+        dist[round(total, 9)] += b - a
+    return sorted(dist.items())
+
+
+def _cdfs(dists):
+    return [([t for t, _ in d], list(accumulate(p for _, p in d))) for d in dists]
+
+
+def _p_below(values, cum, total, or_equal=False):
+    i = (bisect.bisect_right if or_equal else bisect.bisect_left)(values, total)
+    return cum[i - 1] if i else 0.0
+
+
+def flip_probability(leader, others):
+    """P(some other proposal's total >= the leader's), proposals independent of each
+    other. A tie counts as a flip."""
+    cdfs, stays = _cdfs(others), 0.0
+    for total, p in leader:
+        stays += p * math.prod(_p_below(values, cum, total) for values, cum in cdfs)
+    return min(max(1.0 - stays, 0.0), 1.0)
+
+
+def expected_loss(leader, others):
+    """E[max(0, best other total - leader's total)]: the score given up, on average, by
+    committing to the leader now rather than after every answer is known."""
+    cdfs = _cdfs(others)
+    support = sorted({t for values, _ in cdfs for t in values})
+    best, previous = [], 0.0  # the distribution of the best other total
+    for t in support:
+        below = math.prod(_p_below(values, cum, t, or_equal=True) for values, cum in cdfs)
+        best.append((t, below - previous))
+        previous = below
+    tail_p = list(accumulate((p for _, p in reversed(best)), initial=0.0))[::-1]
+    tail_tp = list(accumulate((t * p for t, p in reversed(best)), initial=0.0))[::-1]
+    loss = 0.0
+    for total, p in leader:
+        i = bisect.bisect_right(support, total)
+        loss += p * (tail_tp[i] - total * tail_p[i])
+    return max(loss, 0.0)
+
+
+def shadow_gate(judged, scored, rubric, constraints, mandatory=()):
+    """The research's proposed gate, REPORTED ONLY: `decide` still makes the call until
+    replayed decisions show this one does better. It asks three questions instead of
+    one weakest-link confidence check:
+      ranking        is the leader really ahead? the margin, and the exact chance the
+                     order flips under the judge's own distributions (ties count)
+      eligibility    could a veto answer near its threshold change the pick?
+      acceptability  does the leader clear the floor and every mandatory constraint?"""
+    rule, reasons = rubric['decision'], []
+    ok = [s for s in scored if not s.get('error')]
+    eligible = sorted((s for s in ok if not s['vetoes']), key=lambda s: s['total'], reverse=True)
+    if len(ok) < len(scored):
+        reasons.append('at least one proposal was not judged')
+    if not eligible:
+        return {'action': 'escalate', 'recommendation': None, 'ranking': None,
+                'reasons': reasons + ['no proposal survived judging']}
+    winner, rows = eligible[0], {r['label']: r for r in judged}
+    ranking = None
+    if len(eligible) > 1:
+        runner_up = eligible[1]
+        margin = winner['total'] - runner_up['total']
+        ranking = {'runner_up': runner_up['label'], 'margin': margin, 'ties': 'count as flips', 'method': 'exact'}
+        if margin < rule['min_margin']:
+            reasons.append(f"{winner['label']} leads {runner_up['label']} by {margin:.4f}, below min_margin {rule['min_margin']}")
+        items = {s['label']: answer_distributions(rows[s['label']], rubric, constraints) for s in eligible}
+        if any(v is None for v in items.values()):
+            ranking['unavailable'] = 'the judge gave no probability distributions'
+            reasons.append('ranking uncertainty unavailable: the judge gave no probability distributions')
+        else:
+            for suffix, together in (('', False), ('_together', True)):
+                dists = {label: total_distribution(it, together) for label, it in items.items()}
+                others = [d for label, d in dists.items() if label != winner['label']]
+                ranking['p_flip' + suffix] = flip_probability(dists[winner['label']], others)
+                ranking['expected_loss' + suffix] = expected_loss(dists[winner['label']], others)
+            if ranking['p_flip'] > rule['max_flip']:
+                reasons.append(f"P(ranking flips) is {ranking['p_flip']:.3f}, above max_flip {rule['max_flip']}")
+    band = rule['veto_band']
+    for s in ok:
+        answers = rows[s['label']]['answers']
+        near = [v for v in rubric.get('vetoes', []) if abs(answers[v['id']]['noul'] - v['threshold']) <= band + 1e-9]
+        if s is winner and near:
+            reasons.append(f"{s['label']} is within {band} of the threshold on " + ', '.join(
+                f"{v['id']} (p={answers[v['id']]['noul']:.2f}, threshold {v['threshold']})" for v in near)
+                + ': a slightly different answer would remove the leader')
+        fired = {v['id'] for v in s['vetoes']}
+        if fired and fired <= {v['id'] for v in near} and s['total'] >= winner['total']:
+            reasons.append(f"{s['label']} (total {s['total']:.3f}) is vetoed only by answers within {band} of the "
+                           f"threshold ({', '.join(sorted(fired))}): a slightly different answer would make it the pick")
+    if winner['total'] < rule['min_total']:
+        reasons.append(f"{winner['label']} scores {winner['total']:.3f}, below the floor min_total {rule['min_total']}")
+    need = (1 + rule['min_confidence']) / 2  # a confident yes: |2p - 1| >= min_confidence on the yes side
+    for d in (d for d in rubric['dimensions'] if 'per_constraint' in d):
+        for i in mandatory:
+            c = winner['dimensions'][d['id']]['constraints'][i - 1]
+            if c['probability'] < need:
+                reasons.append(f"mandatory constraint {i} is open on {winner['label']}: p={c['probability']:.2f} on "
+                               f"{d['id']} for \"{c['constraint']}\", below {need:.2f}")
+    return {'action': 'escalate' if reasons else 'recommend', 'recommendation': winner['label'],
+            'recommended_source': winner['source'], 'ranking': ranking, 'reasons': reasons}
+
+
+def check_mandatory(mandatory, constraints, rubric):
+    """Constraint numbers (1-based, as printed) the owner marks as mandatory adoption checks."""
+    if mandatory and not any('per_constraint' in d for d in rubric['dimensions']):
+        raise ValueError('--mandatory needs a per_constraint dimension in the rubric')
+    bad = [i for i in mandatory if not 1 <= i <= len(constraints)]
+    if bad:
+        raise ValueError(f'--mandatory {bad}: the brief has constraints 1 to {len(constraints)}')
+    return sorted(set(mandatory))
+
+
+def build_report(brief, judged, rubric, judge_name, seed, judge_info=None, mandatory=(), complete=True):
     constraints = parse_constraints(brief)
     scored = [score_row(row, rubric, constraints) for row in judged]
-    return {'schema_version': SCHEMA_VERSION, 'judge': judge_name, 'seed': seed,
-            'brief_sha256': hashlib.sha256(brief.encode()).hexdigest(), 'constraints': constraints,
-            'rubric': rubric, 'judged': judged, 'scored': scored, 'decision': decide(scored, rubric)}
+    return {'schema_version': SCHEMA_VERSION, 'complete': complete, 'created_at': now_utc(),
+            'tool_sha256': TOOL_SHA256, 'python': platform.python_version(), 'judge': judge_name,
+            'judge_config': judge_info or {}, 'seed': seed, 'brief_sha256': sha256(brief.encode()),
+            'constraints': constraints, 'mandatory_constraints': list(mandatory), 'rubric': rubric,
+            'judged': judged, 'scored': scored, 'decision': decide(scored, rubric),
+            'shadow': shadow_gate(judged, scored, rubric, constraints, mandatory)}
 
 
-def rescore(report, rubric):
+def rescore(report, rubric, mandatory=None):
     """New weights or thresholds over the SAME raw answers. No judge call. The new
     rubric must ask exactly the same questions, or the stored answers would not apply:
     reworded levels or instructions need a new judge run."""
+    if not isinstance(report, dict) or report.get('schema_version', 1) > SCHEMA_VERSION:
+        raise ValueError(f'this report is not one this tool can read (schema {SCHEMA_VERSION} or older)')
+    if report.get('complete') is False:
+        raise ValueError('this report is a checkpoint of a judge run that stopped part-way: judge again')
     constraints = report.get('constraints', [])  # schema 1 reports predate per-constraint questions
     if build_questions(rubric, constraints) != build_questions(report['rubric'], constraints):
         raise ValueError('rescore needs the same questions (ids, instructions and levels) as the original '
                          'run; only weights, thresholds and decision rules may change')
+    mandatory = check_mandatory(report.get('mandatory_constraints', []) if mandatory is None else mandatory,
+                                constraints, rubric)
     scored = [score_row(row, rubric, constraints) for row in report['judged']]
-    return {**report, 'rubric': rubric, 'scored': scored, 'decision': decide(scored, rubric)}
+    return {**report, 'rubric': rubric, 'mandatory_constraints': mandatory, 'scored': scored,
+            'decision': decide(scored, rubric), 'shadow': shadow_gate(report['judged'], scored, rubric, constraints, mandatory)}
+
+
+# --- decision journal: what replay and validation will need -------------------------
+
+def append_jsonl(path, record):
+    with open(path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(record, allow_nan=False) + '\n')
+
+
+def journal_run(path, report, report_path):
+    """One line per run with both verdicts, so the gates can later be compared on the
+    decisions you label."""
+    d, s = report['decision'], report['shadow']
+    append_jsonl(path, {
+        'kind': 'run', 'logged_at': now_utc(), 'tool_sha256': TOOL_SHA256, 'report': str(report_path),
+        'report_sha256': sha256(Path(report_path).read_bytes()), 'brief_sha256': report['brief_sha256'],
+        'rubric_sha256': sha256(json.dumps(report['rubric'], sort_keys=True).encode()),
+        'models': sorted({row['model'] for row in report['judged'] if row.get('model')}),
+        'mandatory_constraints': report.get('mandatory_constraints', []),
+        'operative': {'action': d['action'], 'source': d.get('recommended_source')},
+        'shadow': {'action': s['action'], 'source': s.get('recommended_source'),
+                   'p_flip': (s.get('ranking') or {}).get('p_flip')}})
+
+
+def wrong_rate_bound(wrong, n, confidence):
+    """Exact one-sided (Clopper-Pearson) upper bound on the rate of wrong
+    recommendations, from `wrong` out of `n` recommended."""
+    if n == 0 or wrong >= n:
+        return 1.0
+    lo, hi = wrong / n, 1.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        tail = sum(math.comb(n, i) * mid ** i * (1 - mid) ** (n - i) for i in range(wrong + 1))
+        lo, hi = (mid, hi) if tail > 1 - confidence else (lo, mid)
+    return hi
+
+
+def validate(records):
+    """Risk and coverage of each gate on labelled decisions: the latest run and the
+    latest label of each brief count. A recommendation is wrong when its proposal is
+    not the one you picked; an escalation is never wrong, only uncovered."""
+    runs, labels = {}, {}
+    for r in records:
+        if r.get('kind') == 'run':
+            runs[r['brief_sha256']] = r
+        elif r.get('kind') == 'label':
+            labels[r['brief_sha256']] = r
+    pairs = [(runs[b], labels[b]) for b in runs if b in labels]
+    lines = [f'{len(pairs)} labelled decisions ({len(runs)} run, {len(labels)} labelled)']
+    procedures = {(r['tool_sha256'], r['rubric_sha256'], tuple(r['models'])) for r, _ in pairs}
+    if len(procedures) > 1:
+        lines.append(f'warning: these runs used {len(procedures)} procedures (tool, rubric or model). Only a '
+                     'procedure frozen in advance and run on decisions it was not tuned on certifies anything.')
+    lines += ['', f"{'gate':10}{'decisions':>10}{'recommended':>13}{'wrong':>7}{'coverage':>10}   wrong at most (90% / 95%)"]
+    for gate in ('operative', 'shadow'):
+        picks = [(r[gate]['source'], label['pick']) for r, label in pairs if r[gate]['action'] == 'recommend']
+        n, k, wrong = len(pairs), len(picks), sum(source != pick for source, pick in picks)
+        coverage = f'{k / n:.0%}' if n else '-'
+        lines.append(f'{gate:10}{n:>10}{k:>13}{wrong:>7}{coverage:>10}   '
+                     f'{wrong_rate_bound(wrong, k, 0.90):.0%} / {wrong_rate_bound(wrong, k, 0.95):.0%}')
+    lines += ['', 'Exact one-sided binomial bounds over the recommended decisions. With no wrong ones, '
+              '11 support "at most 20% wrong" at 90% and 29 support "at most 10%" at 95%.']
+    return '\n'.join(lines)
 
 
 # --- CLI ----------------------------------------------------------------------------
+
+ASSUMPTIONS = ("the judge's probabilities are treated as beliefs, with unknown calibration on this task; "
+               "repeat-run noise is covered only by min_margin; max_flip, veto_band and min_total are "
+               "uncalibrated placeholders")
+
 
 def render(report):
     dims = [d['id'] for d in report['rubric']['dimensions']]
@@ -437,61 +857,126 @@ def render(report):
         flag = '  VETOED' if s['vetoes'] else ''
         lines.append(f"{s['label']:12}{s['total']:>7.3f} {cells}   {s['source']}{flag}")
     judged = [s for s in sorted(report['scored'], key=lambda s: s.get('total', -1), reverse=True) if not s.get('error')]
+    mandatory = set(report.get('mandatory_constraints', []))
     for dim in report['rubric']['dimensions']:
         if 'per_constraint' not in dim or not judged or dim['id'] not in judged[0]['dimensions']:
             continue
-        lines += ['', f"{dim['id']}: probability that each proposal addresses the constraint"]
+        lines += ['', f"{dim['id']}: probability that each proposal addresses the constraint"
+                  + ('   (* mandatory)' if mandatory else '')]
         lines.append(f"{'':52}" + ''.join(f"{s['label'].split()[-1]:>6}" for s in judged))
         for i, text in enumerate(report.get('constraints', [])):
             short = text if len(text) <= 46 else text[:45] + '…'
             cells = ''.join(f"{s['dimensions'][dim['id']]['constraints'][i]['probability']:>6.2f}" for s in judged)
-            lines.append(f'  {i + 1}. {short:<47}{cells}')
+            lines.append(f"{'*' if i + 1 in mandatory else ' '} {i + 1}. {short:<47}{cells}")
     d = report['decision']
     verdict = (f"RECOMMEND {d['recommendation']} ({d['recommended_source']})" if d['action'] == 'recommend'
-               else f"ESCALATE TO A HUMAN" + (f" (leader: {d['recommendation']})" if d['recommendation'] else ''))
+               else 'ESCALATE TO A HUMAN' + (f" (leader: {d['recommendation']})" if d['recommendation'] else ''))
     lines += ['', verdict] + [f'  - {r}' for r in d['reasons']]
+    shadow = report.get('shadow')
+    if shadow:
+        would = (f"RECOMMEND {shadow['recommendation']}" if shadow['action'] == 'recommend'
+                 else 'ESCALATE' + (f" (leader: {shadow['recommendation']})" if shadow['recommendation'] else ''))
+        lines += ['', f'shadow gate (reported only; the verdict above decides): would {would}']
+        r = shadow.get('ranking') or {}
+        if 'p_flip' in r:
+            lines.append(f"  ranking: leads {r['runner_up']} by {r['margin']:.3f}; P(flip) {r['p_flip']:.3f} with "
+                         f"answers independent, {r['p_flip_together']:.3f} if each proposal's answers move together "
+                         f"(ties count as flips); expected loss {r['expected_loss']:.3f} / {r['expected_loss_together']:.3f}")
+        lines += [f'  - {reason}' for reason in shadow['reasons']]
+        lines.append(f'  assumptions: {ASSUMPTIONS}')
     return '\n'.join(lines)
 
 
 def read_proposals(paths):
-    return [(Path(p).name, Path(p).read_text(encoding='utf-8').strip()) for p in paths]
+    return [(Path(p).name, Path(p).read_text(encoding='utf-8').strip(), str(p)) for p in paths]
 
 
-def main(argv=None, out=None):
-    out = out or sys.stdout
-    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+def write_json(path, data):
+    """Through a temp file and os.replace, so a crash never leaves half a report."""
+    path = Path(path)
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(json.dumps(data, indent=2, allow_nan=False), encoding='utf-8')
+    os.replace(tmp, path)
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description=(__doc__ or '').split('\n\n')[0])
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('judge', 'show-request'):
+    for name in ('judge', 'show-request', 'rescore'):
         p = sub.add_parser(name)
-        p.add_argument('--brief', required=True)
-        p.add_argument('--proposals', nargs='+', required=True)
-        p.add_argument('--rubric', default=str(DEFAULT_RUBRIC))
-        p.add_argument('--seed', type=int, default=0)
-        p.add_argument('--typesafe-model', default=DEFAULT_MODEL,
-                       help='alias or version; pin a version such as jev-1.13.0 once thresholds are tuned')
+        if name == 'rescore':
+            p.add_argument('--report', required=True)
+            p.add_argument('--rubric', required=True)
+        else:
+            p.add_argument('--brief', required=True)
+            p.add_argument('--proposals', nargs='+', required=True)
+            p.add_argument('--rubric', default=str(DEFAULT_RUBRIC))
+            p.add_argument('--seed', type=int, default=0)
+            p.add_argument('--typesafe-model', default=DEFAULT_MODEL,
+                           help='alias or version; pin a version such as jev-1.13.0 once thresholds are tuned')
+        if name == 'show-request':
+            continue
         if name == 'judge':
             p.add_argument('--judge', choices=('typesafe', 'ollama'), default='typesafe')
             p.add_argument('--ollama-url', default='http://localhost:11434')
             p.add_argument('--ollama-model', default='qwen2.5:7b')
-            p.add_argument('--out', help='write the full JSON report here')
-    p = sub.add_parser('rescore')
-    p.add_argument('--report', required=True)
-    p.add_argument('--rubric', required=True)
+        p.add_argument('--out', help='write the full JSON report here (judge: also after each proposal)')
+        p.add_argument('--mandatory', nargs='+', type=int, metavar='N', default=None,
+                       help='hard constraints (numbered as printed) that are mandatory adoption checks; '
+                            'used by the shadow gate')
+        p.add_argument('--allow-missing-confidence', action='store_true',
+                       help='advisory run: recommend even when the judge reports no confidence (Ollama)')
+        p.add_argument('--journal', help='append this run to a decision journal (needs --out)')
+    p = sub.add_parser('label', help='record the proposal you would pick given what was known, for validate')
+    p.add_argument('--journal', required=True)
+    p.add_argument('--brief', required=True)
+    p.add_argument('--pick', required=True, help='the proposal file you would pick, or "none"')
+    p.add_argument('--note', default='')
+    p = sub.add_parser('validate', help='risk and coverage of the operative and shadow gates on labelled decisions')
+    p.add_argument('--journal', required=True)
     args = parser.parse_args(argv)
+    if getattr(args, 'journal', None) and args.command in ('judge', 'rescore') and not args.out:
+        parser.error('--journal needs --out, so the journal can point at a saved report')
+    return parser, args
 
-    if args.command == 'rescore':
-        report = rescore(json.loads(Path(args.report).read_text(encoding='utf-8')), load_rubric(args.rubric))
-        print(render(report), file=out)
-        return 0 if report['decision']['action'] == 'recommend' else 1
 
+def main(argv=None, out=None):
+    """Exit 0: recommend. 1: escalate. 2: could not run (bad input, no judge, every
+    proposal failed, or a refused key)."""
+    out = out or sys.stdout
+    parser, args = parse_args(argv)
+    try:
+        return run(parser, args, out)
+    except (OSError, ValueError, JudgeError) as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        return 2
+
+
+def run(parser, args, out):
+    if args.command == 'validate':
+        lines = Path(args.journal).read_text(encoding='utf-8').splitlines()
+        print(validate([loads(line) for line in lines if line.strip()]), file=out)
+        return 0
+    if args.command == 'label':
+        brief = Path(args.brief).read_text(encoding='utf-8').strip()
+        append_jsonl(args.journal, {'kind': 'label', 'logged_at': now_utc(), 'brief_sha256': sha256(brief.encode()),
+                                    'pick': Path(args.pick).name, 'note': args.note})
+        return 0
     rubric = load_rubric(args.rubric)
+    if getattr(args, 'allow_missing_confidence', False):
+        rubric['decision']['allow_missing_confidence'] = True
+    if args.command == 'rescore':
+        report = rescore(loads(Path(args.report).read_text(encoding='utf-8')), rubric, args.mandatory)
+        return finish(report, args, out)
+
     brief = Path(args.brief).read_text(encoding='utf-8').strip()
+    constraints = parse_constraints(brief)
     per_constraint = [d['id'] for d in rubric['dimensions'] if 'per_constraint' in d]
-    if per_constraint and not parse_constraints(brief):
+    if per_constraint and not constraints:
         parser.error(f"the rubric asks one question per hard constraint ({', '.join(per_constraint)}), but "
                      f"{args.brief} has no 'Hard constraints:' list of bullets")
     if per_constraint:
-        print(f'note: read {len(parse_constraints(brief))} hard constraints from {args.brief}', file=sys.stderr)
+        print(f'note: read {len(constraints)} hard constraints from {args.brief}', file=sys.stderr)
     # A glob such as examples/x/*.md also matches the brief; it is never a proposal.
     proposals = [p for p in args.proposals if Path(p).resolve() != Path(args.brief).resolve()]
     if len(proposals) < len(args.proposals):
@@ -499,20 +984,38 @@ def main(argv=None, out=None):
     if not proposals:
         parser.error('no proposals left once the brief is excluded')
     anonymised = anonymise(read_proposals(proposals), args.seed)
+    if len({item['source'] for item in anonymised}) < len(anonymised):
+        print('note: two proposals share a file name; the report keeps each one\'s path', file=sys.stderr)
     if args.command == 'show-request':
         for item in anonymised:
             print(f"# {item['label']}  <- {item['source']}", file=out)
             print(json.dumps(build_request(brief, item['text'], rubric, args.typesafe_model), indent=2), file=out)
         return 0
+    mandatory = check_mandatory(args.mandatory or [], constraints, rubric)
     try:
         judge = (TypeSafeJudge(model=args.typesafe_model) if args.judge == 'typesafe'
                  else OllamaJudge(args.ollama_url, args.ollama_model))
     except JudgeError as exc:
         print(f'cannot start judge: {exc}', file=sys.stderr)
         return 2
-    report = build_report(brief, judge_all(brief, anonymised, rubric, judge), rubric, judge.name, args.seed)
+
+    def report_of(rows, complete=True):
+        return build_report(brief, rows, rubric, judge.name, args.seed, judge.info, mandatory, complete)
+
+    checkpoint = (lambda rows: write_json(args.out, report_of(rows, complete=False))) if args.out else None
+    judged = judge_all(brief, anonymised, rubric, judge, checkpoint)
+    code = finish(report_of(judged), args, out)
+    if all(row.get('error') for row in judged):
+        print('error: the judge answered none of the proposals', file=sys.stderr)
+        return 2
+    return code
+
+
+def finish(report, args, out):
     if args.out:
-        Path(args.out).write_text(json.dumps(report, indent=2), encoding='utf-8')
+        write_json(args.out, report)
+    if args.journal:
+        journal_run(args.journal, report, args.out)
     print(render(report), file=out)
     return 0 if report['decision']['action'] == 'recommend' else 1
 

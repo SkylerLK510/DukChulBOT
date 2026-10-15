@@ -1,0 +1,24 @@
+judge: typesafe   model: jev-1.13.0   seed: 0   input tokens: 8470
+
+              total  constraint_f  failure_hand  verifiabilit    simplicity  reversibilit      evidence   source
+Proposal A    0.896          0.72          0.99          1.00          0.81          1.00          0.98   measure-then-decide.md
+Proposal C    0.728          0.70          0.51          0.77          0.82          0.91          0.84   native-windows.md
+Proposal B    0.155          0.22          0.00          0.30          0.01          0.39          0.00   wsl2.md  VETOED
+
+constraint_fit: probability that each proposal addresses the constraint
+                                                         A     C     B
+  1. Remote access to the desktop is NOT configure…   0.84  0.63  0.04
+  2. The desktop's WSL status is unknown; nothing …   0.81  0.89  0.04
+  3. The desktop's CUDA setup is unknown; nothing …   0.10  0.45  0.07
+  4. The desktop's network link is unknown; nothin…   0.93  0.10  0.07
+  5. The Mac worker must be able to reach the coor…   0.92  0.95  0.88
+  6. Checkpoint files must end up on the desktop's…   0.53  0.94  0.37
+  7. Nothing may be assumed to behave on Windows o…   0.94  0.91  0.04
+
+ESCALATE TO A HUMAN (leader: Proposal A)
+  - Proposal B vetoed by violates_hard_constraint (p=0.98 >= 0.7)
+  - judge confidence on Proposal A drops to 0.06 on constraint_fit: unclear whether it addresses "Checkpoint files must end up on the desktop's permanent storage." (p=0.53), below min_confidence 0.5
+
+shadow gate (reported only; the verdict above decides): would RECOMMEND Proposal A
+  ranking: leads Proposal C by 0.168; P(flip) 0.070 with answers independent, 0.266 if each proposal's answers move together (ties count as flips); expected loss 0.003 / 0.029
+  assumptions: the judge's probabilities are treated as beliefs, with unknown calibration on this task; repeat-run noise is covered only by min_margin; max_flip, veto_band and min_total are uncalibrated placeholders
