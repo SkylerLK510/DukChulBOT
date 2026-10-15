@@ -11,6 +11,35 @@ The judge answers typed questions: `Score` questions for most rubric dimensions,
 
 Standard library only, Python 3.11+.
 
+## Install
+
+You need **Python 3.11 or newer**. There is nothing to `pip install`: the council is one file that uses only the standard library.
+
+```sh
+git clone https://github.com/SkylerLK510/DukChulBOT.git
+cd DukChulBOT
+python3 council.py --help
+```
+
+**Pick a judge, once.** DukChulBOT, the default judge, runs an LLM through that model's own command-line tool, so install and log in to one of these:
+
+- **Claude Code:** follow [the setup page](https://code.claude.com/docs/en/setup), then run `claude` once to log in. Use `--judge-cmd claude`.
+- **Codex CLI:** `npm install -g @openai/codex` or `brew install --cask codex` ([README](https://github.com/openai/codex)), then run `codex` once to log in. Use `--judge-cmd codex`.
+- **Anything else** that reads a prompt on stdin and prints its reply works as a full command, for example `--judge-cmd "ollama run qwen2.5:7b"` for a model that never leaves your machine.
+- **TypeSafe's paid API** is optional: `--judge typesafe` with `TYPESAFE_API_KEY` set.
+
+**Try it.** The first two commands make no judge calls:
+
+```sh
+python3 -m unittest -q tests.test_council        # the test suite, offline
+python3 council.py rescore --report examples/coordinator-host/live-run.jev-1.13.0.json --rubric rubrics/system_design.v1.json
+python3 council.py judge --judge-cmd claude --brief examples/coordinator-host/brief.md --proposals examples/coordinator-host/*.md
+```
+
+The last command sends the example brief and proposals to the judge's provider, 6 runs per proposal. Run `show-request` first to see exactly what is sent.
+
+On Windows, a timeout kills the judge command itself but not processes it started, because process groups are a POSIX feature.
+
 ## Use
 
 ```sh
