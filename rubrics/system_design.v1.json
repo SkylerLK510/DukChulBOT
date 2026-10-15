@@ -1,0 +1,99 @@
+{
+  "name": "system_design",
+  "note": "Weights and thresholds are starting points. Calibrate them by replaying past decisions whose outcome you know, then adjust with `rescore` (no new judge calls). max_flip and veto_band drive only the shadow gate, which is reported but not operative.",
+  "dimensions": [
+    {
+      "id": "constraint_fit",
+      "weight": 0.25,
+      "per_constraint": {
+        "question": "Does `proposal` say what in its chosen design or plan meets `constraint`?",
+        "criteria": {
+          "true": "The proposal commits to a design or plan, and a specific choice, mechanism or check in it deals with this constraint. It counts even when the constraint is not named, as long as the step plainly targets the constraint's subject.",
+          "false": "The proposal is silent on this constraint, even if nothing in the design seems to conflict with it. Not depending on something forbidden is not the same as dealing with it. Also false: the proposal only asserts that the constraint will be met ('it will work', 'everything will work the same way'), only discusses trade-offs without choosing a design, addresses a different system than the one the constraint names, or contradicts the constraint."
+        }
+      }
+    },
+    {
+      "id": "failure_handling",
+      "weight": 0.2,
+      "instructions": "How does `proposal` deal with things going wrong, such as crashes, partial writes, lost messages or bad input?",
+      "levels": [
+        "Does not mention failure at all",
+        "Mentions failure in general terms without saying what the system does",
+        "Names specific failure cases and what the system does in each",
+        "Names specific failure cases, what the system does in each, and how that behaviour would be tested"
+      ]
+    },
+    {
+      "id": "verifiability",
+      "weight": 0.2,
+      "instructions": "How checkable is `proposal`: could someone tell from a test or a measurement whether it worked?",
+      "levels": [
+        "States no way to check whether it worked",
+        "Says it should be tested but gives no concrete check",
+        "Gives at least one concrete check with an observable outcome",
+        "Gives concrete pass or fail criteria for its main claims, including at least one failure test"
+      ]
+    },
+    {
+      "id": "simplicity",
+      "weight": 0.15,
+      "instructions": "How much does `proposal` add that the decision in `decision_brief` does not need? A step that checks something `decision_brief` says is unknown or unverified counts as needed.",
+      "levels": [
+        "Adds several components, services or steps that the decision does not need",
+        "Adds one significant component, service or step that the decision does not need",
+        "Adds nothing significant beyond what the decision needs"
+      ]
+    },
+    {
+      "id": "reversibility",
+      "weight": 0.1,
+      "instructions": "How costly would it be to back out of `proposal` if it turns out to be wrong?",
+      "levels": [
+        "Commits to a choice that would require rewriting most of the system to undo",
+        "Undoing it would require significant rework in more than one component",
+        "Undoing it is confined to one component or one interface",
+        "Explicitly keeps the alternative open, for example behind an interface or a measured decision rule"
+      ]
+    },
+    {
+      "id": "evidence",
+      "weight": 0.1,
+      "instructions": "How well does `proposal` separate what is known from what is assumed?",
+      "levels": [
+        "Presents assumptions as established facts",
+        "Mixes verified facts and assumptions without saying which is which",
+        "Labels its main assumptions as assumptions",
+        "Labels assumptions, cites or measures the facts it relies on, and says what would change its conclusion"
+      ]
+    }
+  ],
+  "vetoes": [
+    {
+      "id": "violates_hard_constraint",
+      "threshold": 0.7,
+      "instructions": "Does `proposal` depend on something that `decision_brief` explicitly rules out or says is unavailable?",
+      "criteria": {
+        "true": "The proposal needs an action, tool, access or condition the brief explicitly forbids or says does not exist yet",
+        "false": "Nothing the proposal needs conflicts with an explicit prohibition or stated unavailability in the brief"
+      }
+    },
+    {
+      "id": "leaves_decision_unanswered",
+      "threshold": 0.7,
+      "instructions": "Does `proposal` leave the decision that `decision_brief` asks for unanswered?",
+      "criteria": {
+        "true": "It recommends something about a different decision, or makes no recommendation about this one",
+        "false": "It answers this decision, either by picking an option or by giving a rule that says which option to pick once named facts are checked"
+      }
+    }
+  ],
+  "decision": {
+    "min_confidence": 0.5,
+    "min_margin": 0.05,
+    "min_total": 0.25,
+    "max_flip": 0.1,
+    "veto_band": 0.06,
+    "allow_missing_confidence": false
+  }
+}

@@ -1,10 +1,10 @@
 {
   "name": "system_design",
-  "note": "Weights and thresholds are starting points. Calibrate them by replaying past decisions whose outcome you know, then adjust with `rescore` (no new judge calls). max_flip and veto_band drive only the shadow gate, which is reported but not operative.",
+  "note": "Weights and thresholds are starting points. Calibrate them by replaying past decisions whose outcome you know, then adjust with `rescore` (no new judge calls). max_flip and veto_band drive only the shadow gate, which is reported but not operative. Reports judged before the headroom question was added rescore with system_design.v1.json, which asks the same questions they were asked.",
   "dimensions": [
     {
       "id": "constraint_fit",
-      "weight": 0.25,
+      "weight": 0.22,
       "per_constraint": {
         "question": "Does `proposal` say what in its chosen design or plan meets `constraint`?",
         "criteria": {
@@ -15,7 +15,7 @@
     },
     {
       "id": "failure_handling",
-      "weight": 0.2,
+      "weight": 0.17,
       "instructions": "How does `proposal` deal with things going wrong, such as crashes, partial writes, lost messages or bad input?",
       "levels": [
         "Does not mention failure at all",
@@ -26,7 +26,7 @@
     },
     {
       "id": "verifiability",
-      "weight": 0.2,
+      "weight": 0.17,
       "instructions": "How checkable is `proposal`: could someone tell from a test or a measurement whether it worked?",
       "levels": [
         "States no way to check whether it worked",
@@ -37,7 +37,7 @@
     },
     {
       "id": "simplicity",
-      "weight": 0.15,
+      "weight": 0.13,
       "instructions": "How much does `proposal` add that the decision in `decision_brief` does not need? A step that checks something `decision_brief` says is unknown or unverified counts as needed.",
       "levels": [
         "Adds several components, services or steps that the decision does not need",
@@ -47,7 +47,7 @@
     },
     {
       "id": "reversibility",
-      "weight": 0.1,
+      "weight": 0.09,
       "instructions": "How costly would it be to back out of `proposal` if it turns out to be wrong?",
       "levels": [
         "Commits to a choice that would require rewriting most of the system to undo",
@@ -58,13 +58,24 @@
     },
     {
       "id": "evidence",
-      "weight": 0.1,
+      "weight": 0.09,
       "instructions": "How well does `proposal` separate what is known from what is assumed?",
       "levels": [
         "Presents assumptions as established facts",
         "Mixes verified facts and assumptions without saying which is which",
         "Labels its main assumptions as assumptions",
         "Labels assumptions, cites or measures the facts it relies on, and says what would change its conclusion"
+      ]
+    },
+    {
+      "id": "headroom",
+      "weight": 0.13,
+      "instructions": "First, does `decision_brief` say the load or size will grow, for example more users, workers, tenants or data by a stated time? If it does not, pick the level that says so. If it does, work out from the numbers that `decision_brief` and `proposal` give, not from what `proposal` claims, whether `proposal` still meets the constraints in `decision_brief` at that coming load.",
+      "levels": [
+        "It would stop meeting a constraint at the load `decision_brief` says is coming, and it does not say so",
+        "It does not say how it behaves at that coming load, and the numbers given do not settle it",
+        "It would stop meeting a constraint at that load, but it names the load where it stops and what replaces it before then",
+        "`decision_brief` states no coming growth; or it holds at that load, shown with arithmetic or a measurement"
       ]
     }
   ],

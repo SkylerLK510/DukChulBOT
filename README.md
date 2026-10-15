@@ -46,7 +46,7 @@ python3 council.py label --journal ~/council/decisions.jsonl --brief BRIEF.md --
 python3 council.py validate --journal ~/council/decisions.jsonl
 
 # try rescore with no key, on a saved live report of the worked example
-python3 council.py rescore --report examples/coordinator-host/live-run.jev-1.13.0.json --rubric rubrics/system_design.json
+python3 council.py rescore --report examples/coordinator-host/live-run.jev-1.13.0.json --rubric rubrics/system_design.v1.json
 ```
 
 A glob over a folder may include the brief itself. It is left out of the proposals, with a note on stderr.
@@ -167,7 +167,13 @@ How the council is run with other seats (Claude, Codex) is in [PROTOCOL.md](PROT
 
 The report header names the model version that answered and the input tokens used. `jev-latest` is an alias that moves when TypeSafe ships a release, so once `min_confidence` and the veto thresholds have been tuned against real decisions, pin that version with `--typesafe-model` and move on your own schedule.
 
-`rubrics/system_design.json` scores constraint fit (per constraint), failure handling, verifiability, simplicity, reversibility and evidence, and vetoes proposals that depend on something the brief rules out or that leave the decision unanswered (a rule that says which option to pick once named facts are checked counts as an answer). Its weights and thresholds are starting points, not findings. `rescore` only accepts a rubric that asks exactly the same questions: reworded instructions or levels need a new judge run.
+`rubrics/system_design.json` scores constraint fit (per constraint), failure handling, verifiability, simplicity, reversibility, evidence and **headroom**, and vetoes proposals that depend on something the brief rules out or that leave the decision unanswered (a rule that says which option to pick once named facts are checked counts as an answer). Its weights and thresholds are starting points, not findings. `rescore` only accepts a rubric that asks exactly the same questions: reworded instructions or levels need a new judge run.
+
+**Headroom.** It asks whether a proposal still meets the constraints at the load the brief says is coming, worked out from the numbers given. A brief that states no growth gets the top level.
+- **Why it was added.** It came from `examples/probes/scale-trap`: without it, both LLM judges ranked a design that breaks at the stated load second.
+- **Rewording.** It was reworded to ask first whether the brief states any growth. Before that, Claude gave lower levels on a brief with no growth in 16 of 25 samples.
+- **Live check, pre-registered.** On a no-growth brief, every sample now picks the top level. Both traps get level 0 in every sample and rank below the designs that hold (`design-council-research/headroom-default/`).
+- **Older reports.** Reports judged before it existed, such as the saved live run, rescore with `rubrics/system_design.v1.json`.
 
 ## What is and is not validated
 

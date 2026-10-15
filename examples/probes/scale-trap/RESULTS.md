@@ -74,3 +74,9 @@ All four runs escalate, because the two good proposals are within `min_margin` o
    - **Overfitting.** The headroom question was written by the author of the first case.
    - **Coverage.** No case yet has the breaking load stated only in a proposal, nor growth with no number.
    - **Neutrality.** Claude does not reliably apply the question's escape clause on a brief with no growth (see 3).
+
+**Later the same day: adopted into the default rubric.** The question was reworded to ask first whether the brief states coming growth, then checked live against criteria registered in advance:
+- **No growth stated** (the worked example): every sample picks the top level.
+- **Both traps** get level 0 in every sample and rank below the designs that hold.
+
+It is `headroom` in `rubrics/system_design.json`. Weights were rescaled to sum to 1.
