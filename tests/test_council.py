@@ -915,6 +915,42 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(len(judge.seen), 1)
 
 
+class MandatoryTests(unittest.TestCase):
+    """--mandatory is operative: it only ever adds blockers to the leader."""
+
+    def scored(self, p, confidence=True):
+        constraints = c.parse_constraints(BRIEF)
+        addressed = {'constraint_fit.1': 0.95, 'constraint_fit.2': p}
+        row = {'label': 'Proposal A', 'source': 'a.md',
+               'answers': answers({d['id']: 3 for d in rubric()['dimensions'] if 'levels' in d}, addressed=addressed)}
+        if not confidence:
+            row['answers']['constraint_fit.2']['confidence'] = None
+        return [c.score_row(row, rubric(), constraints)]
+
+    def test_a_confident_no_on_a_mandatory_constraint_escalates(self):
+        self.assertEqual(c.decide(self.scored(0.05), rubric())['action'], 'recommend')  # not mandatory: unchanged
+        d = c.decide(self.scored(0.05), rubric(), mandatory=[2])
+        self.assertEqual((d['action'], d['recommendation']), ('escalate', 'Proposal A'))
+        self.assertIn('mandatory constraint 2 is open', ' '.join(d['reasons']))
+
+    def test_a_confident_yes_passes_and_an_unknown_confidence_does_not(self):
+        self.assertEqual(c.decide(self.scored(0.95), rubric(), mandatory=[2])['action'], 'recommend')
+        r = rubric()
+        r['decision']['allow_missing_confidence'] = True  # the opt-out never waives a mandatory check
+        d = c.decide(self.scored(0.95, confidence=False), r, mandatory=[2])
+        self.assertEqual(d['action'], 'escalate')
+        self.assertIn('cannot be checked', ' '.join(d['reasons']))
+
+    def test_rescore_applies_mandatory_to_the_operative_gate(self):
+        live = json.loads((EXAMPLE / 'live-run.jev-1.13.0.json').read_text())
+        plain = c.rescore(live, rubric())
+        strict = c.rescore(live, rubric(), mandatory=[6])
+        self.assertEqual(strict['decision']['recommendation'], plain['decision']['recommendation'])
+        self.assertTrue(set(plain['decision']['reasons']) <= set(strict['decision']['reasons']))
+        self.assertIn('mandatory constraint 6', ' '.join(strict['decision']['reasons']))
+        self.assertEqual(strict['decision']['action'], 'escalate')
+
+
 class ShadowGateTests(unittest.TestCase):
     LIVE = EXAMPLE / 'live-run.jev-1.13.0.json'
 

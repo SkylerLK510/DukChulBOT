@@ -37,7 +37,7 @@ python3 council.py judge --judge ollama --allow-missing-confidence --brief BRIEF
 # change weights or thresholds later without asking the judge again
 python3 council.py rescore --report run.report.json --rubric my_rubric.json
 
-# mark hard constraints 2 and 6 (numbered as printed) as mandatory adoption checks for the shadow gate
+# mark hard constraints 2 and 6 (numbered as printed) as mandatory: recommend only if the judge confidently says the leader meets each
 python3 council.py rescore --report run.report.json --rubric rubrics/system_design.json --mandatory 2 6
 
 # keep a decision journal, record what you would pick, and see how each gate does
@@ -115,7 +115,7 @@ A custom command is run as given, with the caller's environment, so its isolatio
 1. Proposals are shuffled and relabelled `Proposal A, B, ...`. The judge sees only the brief and the proposal text. The label-to-file map stays in the report.
 2. Each proposal is judged **independently** with the same questions over the same brief, one request per proposal, so scores are comparable. Because no proposal is judged next to another, presentation order cannot bias the judge.
 3. Each `Score` is normalised to 0..1. A `per_constraint` dimension such as `constraint_fit` asks one `Noul` per hard constraint (does the proposal say what in its chosen design or plan meets it?) and scores the mean probability, the expected share of constraints it deals with. The dimensions are combined with the rubric weights. A `Noul` veto at or above its threshold removes a proposal regardless of its score.
-4. The leader is recommended only if it beats the runner-up by `min_margin`, scores at least the floor `min_total` (a sole survivor too), the judge reported a confidence on every dimension and the lowest is at least `min_confidence`, and every proposal was judged. Otherwise the council escalates and lists the reasons. For a per-constraint answer, confidence is `|2p − 1|`, the formula TypeSafe's confidence docs give for a Noul: 0.5 means `p` outside 0.25 to 0.75. An escalation lists every constraint the judge was unsure about, least certain first. A judge that reports no confidence (the Ollama judge) escalates unless the run passes `--allow-missing-confidence`, which marks it advisory.
+4. The leader is recommended only if it beats the runner-up by `min_margin`, scores at least the floor `min_total` (a sole survivor too), the judge reported a confidence on every dimension and the lowest is at least `min_confidence`, every proposal was judged, and the judge confidently says the leader meets every `--mandatory` constraint. Otherwise the council escalates and lists the reasons. For a per-constraint answer, confidence is `|2p − 1|`, the formula TypeSafe's confidence docs give for a Noul: 0.5 means `p` outside 0.25 to 0.75. An escalation lists every constraint the judge was unsure about, least certain first. A judge that reports no confidence (the Ollama judge) escalates unless the run passes `--allow-missing-confidence`, which marks it advisory.
 
 Every answer is checked before it counts: a Score outside its levels, a missing or malformed probability distribution, a bool where a number belongs, or a NaN or infinite value makes that proposal an error rather than being clamped or skipped. A NaN veto used to let its proposal through, because NaN >= 0.7 is false.
 
@@ -141,7 +141,7 @@ The confidence gate above answers one question with the leader's single least ce
   - a judge that reports no uncertainty, such as the Ollama judge, whose probabilities are picks;
   - a rubric with more than 50,000 possible totals per proposal.
 - **Eligibility: could a veto change the pick?** It flags a leader whose veto answer is within `veto_band` of its threshold, and a vetoed proposal that would win if answers within the band went the other way.
-- **Acceptability: is the leader fit to adopt?** It checks the floor `min_total` and every constraint you mark with `--mandatory`. A mandatory constraint needs a confident yes, `p >= (1 + min_confidence) / 2`, from a judge that reports confidence.
+- **Acceptability: is the leader fit to adopt?** It checks the floor `min_total` and every constraint you mark with `--mandatory`. A mandatory constraint needs a confident yes, `p >= (1 + min_confidence) / 2`, from a judge that reports confidence. This check is also operative: the verdict above applies it too, so a mandatory constraint the leader does not confidently meet always escalates. It only adds blockers; it never changes the leader.
 
 It is **reported, not operative**. Every report prints what the shadow gate would do under the verdict, and the journal records both. Switch only when `validate` shows, on decisions labelled after the procedure was frozen, that it escalates less without more wrong recommendations. `max_flip` (0.10) and `veto_band` (0.06) are placeholders: the band is the largest repeat-run movement seen, not a bound. On the live run the shadow gate would recommend Proposal A at P(flip) 0.070, or 0.266 in the stress case; with `--mandatory 6` it escalates on the checkpoint-storage constraint, which is the adoption question the old gate was pointing at.
 
@@ -206,7 +206,7 @@ Live, with DukChulBOT on 2026-10-15 (then called the cmd judge, so its reports s
   - **Where they differ.** The verdict differs: Jev escalated, and all three DukChulBOT runs recommend (see below). Codex also gives the leader 0.20 on the WSL constraint, where Jev gave 0.81.
   - **Time.** Claude took 22 s for 25 calls, and Codex 1 min 54 s.
   - **Repeat runs.** A repeat Claude run moved the real proposals' totals by up to 0.020 (Jev: 0.018). A single yes/no answer moved by 0.20, one whole sample (Jev: 0.06).
-  - **Why the verdict differs.** Both judges are unanimous that the leader does *not* deal with "checkpoint files must end up on the desktop's permanent storage" (p = 0.00, where Jev gave 0.53). A confident "no" is not a low confidence, so the operative gate recommends. Mark that constraint `--mandatory` and the shadow gate escalates on it. Mandatory checks are not operative yet.
+  - **Why the verdict differs.** Both judges are unanimous that the leader does *not* deal with "checkpoint files must end up on the desktop's permanent storage" (p = 0.00, where Jev gave 0.53). A confident "no" is not a low confidence, so the operative gate recommends. Mark that constraint `--mandatory` and the council escalates on it.
 - **A design that is right today and wrong at the stated scale** (`examples/probes/scale-trap`, pre-registered in its `EXPECTED.md`, results in its `RESULTS.md`). When the growth to 200 workers sits only in the brief's context:
   - **Both judges miss it.** They rank the design that breaks at that load second, ahead of the one sized for it, and the run escalates only because the lead is under `min_margin`.
   - **Stating the scale as a hard constraint helps.** Both judges then answer that the trap does not hold at that load (p = 0.00). Claude ranks it third. Codex still ranks it second, 0.007 ahead of the design sized for it, which the probe's own flaw explains (see RESULTS.md).

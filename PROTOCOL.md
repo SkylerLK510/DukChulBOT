@@ -11,7 +11,7 @@ How a design decision goes through the council when several seats take part (for
 
 1. **Write the brief first.** State the decision, the context, and one requirement per bullet under `Hard constraints:`.
    - **Scale.** If the design must survive growth, put the load it must hold at, with numbers, in a hard constraint, not only in the context. `examples/probes/scale-trap` shows why: with growth in the context only, both LLM judges ranked a design that breaks at the stated load second and credited it with meeting the constraint it would break. With the same growth as a constraint, both answered that the design does not hold at that load (p = 0.00), though only one of them then ranked it below both designs that do.
-   - **Mandatory checks.** Decide now which constraints are mandatory adoption checks (`--mandatory N ...`), not after seeing the scores.
+   - **Mandatory checks.** Decide now which constraints are mandatory (`--mandatory N ...`), not after seeing the scores. The council then recommends only if the judge confidently says the leader meets each one. A confident "no" otherwise reads as high confidence and passes.
    - **What leaves the machine.** The brief and the proposals go to the judge's provider (Anthropic for `--judge-cmd claude`, OpenAI for `codex`, TypeSafe for `--judge typesafe`), so never put secrets or customer data in them. Run `show-request` first.
 2. **Independent proposals.** Each seat writes its proposal without seeing the others. Each seat gets only the brief and copies of the evidence, in a folder of its own.
 3. **Freeze each seat's position.** Before any seat reads another's proposal, record its pick and its reasons in one short file per seat (`positions/<seat>.md`). Nothing in it changes afterwards.

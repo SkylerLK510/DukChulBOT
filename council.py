@@ -786,9 +786,10 @@ def score_row(row, rubric, constraints=()):
             'no_confidence': [k for k, dim in dims.items() if dim['confidence'] is None or dim.get('confidence_missing')]}
 
 
-def decide(scored, rubric):
+def decide(scored, rubric, mandatory=()):
     """Recommend only when the evidence is clear; otherwise hand it to a person and
-    say exactly why. A recommendation is advice. Nothing here acts on it."""
+    say exactly why. A recommendation is advice. Nothing here acts on it. Mandatory
+    constraints only add blockers: they never change the leader or remove a reason."""
     rule, reasons = rubric['decision'], []
     for s in scored:
         if s.get('error'):
@@ -828,6 +829,7 @@ def decide(scored, rubric):
                 f"\"{c['constraint']}\" (p={c['probability']:.2f})" for c in unclear)
         blockers.append(f"judge confidence on {winner['label']} drops to {winner['min_confidence']:.2f}"
                         f"{f' on {at}' if at else ''}{detail}, below min_confidence {rule['min_confidence']}")
+    blockers += mandatory_reasons(winner, rubric, mandatory)
     return {'action': 'escalate' if blockers else 'recommend', 'recommendation': winner['label'],
             'recommended_source': winner['source'], 'margin': margin, 'reasons': reasons + blockers}
 
@@ -980,7 +982,16 @@ def shadow_gate(judged, scored, rubric, constraints, mandatory=()):
                            f"threshold ({', '.join(sorted(fired))}): a slightly different answer would make it the pick")
     if winner['total'] < rule['min_total']:
         reasons.append(f"{winner['label']} scores {winner['total']:.3f}, below the floor min_total {rule['min_total']}")
-    need = (1 + rule['min_confidence']) / 2  # a confident yes: |2p - 1| >= min_confidence on the yes side
+    reasons += mandatory_reasons(winner, rubric, mandatory)
+    return {'action': 'escalate' if reasons else 'recommend', 'recommendation': winner['label'],
+            'recommended_source': winner['source'], 'ranking': ranking, 'reasons': reasons}
+
+
+def mandatory_reasons(winner, rubric, mandatory):
+    """Why the leader cannot be adopted yet: each mandatory constraint needs a confident yes,
+    |2p - 1| >= min_confidence on the yes side, from a judge that reports confidence. Shared by
+    the operative and shadow gates, so both read "mandatory" the same way."""
+    need, reasons = (1 + rubric['decision']['min_confidence']) / 2, []
     for d in (d for d in rubric['dimensions'] if 'per_constraint' in d):
         for i in mandatory:
             c = winner['dimensions'][d['id']]['constraints'][i - 1]
@@ -990,8 +1001,7 @@ def shadow_gate(judged, scored, rubric, constraints, mandatory=()):
             elif c['probability'] < need:
                 reasons.append(f"mandatory constraint {i} is open on {winner['label']}: p={c['probability']:.2f} on "
                                f"{d['id']} for \"{c['constraint']}\", below {need:.2f}")
-    return {'action': 'escalate' if reasons else 'recommend', 'recommendation': winner['label'],
-            'recommended_source': winner['source'], 'ranking': ranking, 'reasons': reasons}
+    return reasons
 
 
 def check_mandatory(mandatory, constraints, rubric):
@@ -1014,7 +1024,7 @@ def build_report(brief, judged, rubric, judge_name, seed, judge_info=None, manda
               'constraints': constraints, 'mandatory_constraints': list(mandatory), 'rubric': rubric, 'judged': judged}
     if complete:
         scored = [score_row(row, rubric, constraints) for row in judged]
-        report.update(scored=scored, decision=decide(scored, rubric),
+        report.update(scored=scored, decision=decide(scored, rubric, mandatory),
                       shadow=shadow_gate(judged, scored, rubric, constraints, mandatory))
     return report
 
@@ -1039,7 +1049,8 @@ def rescore(report, rubric, mandatory=None):
                                 constraints, rubric)
     scored = [score_row(row, rubric, constraints) for row in report['judged']]
     return {**report, 'rubric': rubric, 'mandatory_constraints': mandatory, 'scored': scored,
-            'decision': decide(scored, rubric), 'shadow': shadow_gate(report['judged'], scored, rubric, constraints, mandatory)}
+            'decision': decide(scored, rubric, mandatory),
+            'shadow': shadow_gate(report['judged'], scored, rubric, constraints, mandatory)}
 
 
 # --- decision journal: what replay and validation will need -------------------------
@@ -1248,8 +1259,8 @@ def parse_args(argv):
             p.add_argument('--ollama-model', default='qwen2.5:7b')
         p.add_argument('--out', help='write the full JSON report here (judge: also after each proposal)')
         p.add_argument('--mandatory', nargs='+', type=int, metavar='N', default=None,
-                       help='hard constraints (numbered as printed) that are mandatory adoption checks; '
-                            'used by the shadow gate')
+                       help='hard constraints (numbered as printed) that must be met before adoption: the leader is '
+                            'recommended only if the judge confidently says it meets each one')
         p.add_argument('--allow-missing-confidence', action='store_true',
                        help='advisory run: recommend even when the judge reports no confidence (Ollama)')
         p.add_argument('--journal', help='append this run to a decision journal (needs --out)')
