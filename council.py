@@ -10,17 +10,20 @@ rank each other in prose, and a chairman LLM writes the verdict. Here:
   3. CODE is the chairman: weights, veto thresholds and a confidence gate decide
      between "recommend X" and "escalate to a human", and say why
 
-The default judge is TypeSafe's System One API (typed answers with probabilities and
-confidence, https://docs.typesafe.ai/api). Raw answers are kept in the report, so
-weights can change later without asking the judge again.
+The default judge is an LLM acting as Jev through its own CLI (claude, codex, or any
+command that reads a prompt on stdin), asked several times per proposal so that
+disagreement between runs gives the probabilities. TypeSafe's paid System One API
+(https://docs.typesafe.ai/api) and a local Ollama model are the other judges. Raw answers
+are kept in the report, so weights can change later without asking the judge again.
 
-Standard library only. The API key is read from TYPESAFE_API_KEY and is never
+Standard library only. The TypeSafe key is read from TYPESAFE_API_KEY and is never
 printed or written. `show-request` prints exactly what would leave the machine.
 """
 from __future__ import annotations
 
 import argparse
 import bisect
+import concurrent.futures
 import datetime
 import hashlib
 import http.client
@@ -30,7 +33,9 @@ import os
 import platform
 import random
 import re
+import shlex
 import string
+import subprocess
 import sys
 import tempfile
 import time
@@ -45,6 +50,15 @@ SCHEMA_VERSION = 3  # 3: provenance, checkpoints, mandatory constraints, the sha
 TYPESAFE_URL = 'https://api.typesafe.ai/v1/systemone'
 DEFAULT_MODEL = 'jev-latest'
 DEFAULT_RUBRIC = Path(__file__).parent / 'rubrics' / 'system_design.json'
+SKILL = Path(__file__).parent / 'skills' / 'judge' / 'SKILL.md'  # the command judge's instructions
+# Commands checked to give the plain model and nothing else: no user settings (the Claude CLI
+# would otherwise load the user's default agent), skills, MCP servers, tools or saved session.
+# CommandJudge also runs every command in an empty folder, so no project instructions or memory load.
+JUDGE_PRESETS = {
+    'claude': ('claude -p --setting-sources project --strict-mcp-config --disable-slash-commands --tools "" '
+               '--no-session-persistence --model sonnet'),
+    'codex': 'codex exec --skip-git-repo-check --ephemeral -s read-only --color never -',
+}
 TOOL_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 # Retry what TypeSafe's own SDK retries (RetryPolicy defaults): 408, 429 and every 5xx,
 # plus connection errors and timeouts. A duplicate POST costs about $0.0001.
@@ -431,6 +445,158 @@ class OllamaJudge:
                             'probabilities': {str(i): float(i == value) for i in range(top + 1)}}
         return {'answers': answers, 'model': f'ollama:{self.model}', 'usage': None,
                 'request_sha256': sha256(body), 'attempts': 1}
+
+
+def skill_prompt():
+    """The command judge's instructions: skills/judge/SKILL.md without its front matter."""
+    text = SKILL.read_text(encoding='utf-8')
+    if text.startswith('---\n'):
+        text = text.split('\n---\n', 1)[1]
+    return text.strip()
+
+
+def score_confidence(probabilities):
+    """TypeSafe's published Score confidence, max(0, 1 - sum p_i |i - m| / MAD_unif): the expected
+    distance from the most likely level m, relative to an even spread's distance from the middle
+    level. It reproduces Jev's own confidence within 0.01 on all 15 live Score answers. With tied
+    most likely levels the farther one is used, so a split never reads as more certain than it is."""
+    p = {int(k): v for k, v in probabilities.items()}
+    n, likeliest = len(p), max(p.values())
+    spread = sum(abs(i - (n - 1) / 2) for i in p) / n
+    distance = max(sum(v * abs(i - m) for i, v in p.items()) for m in p if p[m] == likeliest)
+    return max(0.0, 1 - distance / spread)
+
+
+def judge_prompt(brief, proposal, questions, sample):
+    """One sample's prompt, and the map from each neutral key (q1, q2, ...) to its question id
+    and, for a Score, letter -> level. The judge never sees the rubric's ids. Question order is
+    shuffled per sample, and Score levels are lettered in forward order on even samples and
+    reversed on odd ones, so order effects spread across samples instead of tilting all of
+    them the same way (Xu et al., Findings of EMNLP 2026)."""
+    ids = list(questions)
+    random.Random(sample).shuffle(ids)
+    lines, keys = [], {}
+    for n, qid in enumerate(ids, 1):
+        q, key = questions[qid], f'q{n}'
+        if q['type'] == 'score':
+            levels = list(enumerate(q['criteria']))[::-1 if sample % 2 else 1]
+            lettered = list(zip(string.ascii_lowercase, levels))
+            keys[key] = (qid, {letter: level for letter, (level, _) in lettered})
+            shown = '; '.join(f'({letter}) {text}' for letter, (_, text) in lettered)
+            lines.append(f"- {key}, pick one letter: {describe(q['instructions'])} Levels: {shown}")
+        else:
+            keys[key] = (qid, None)
+            rules = ''.join(f" {k.capitalize()} means: {v.rstrip('.')}." for k, v in (q.get('criteria') or {}).items())
+            lines.append(f"- {key}, true or false: {describe(q['instructions'])}{rules}")
+    state = json.dumps({'decision_brief': brief, 'proposal': proposal}, indent=2, ensure_ascii=False)
+    return f"{skill_prompt()}\n\n## Questions\n\n" + '\n'.join(lines) + f"\n\n## Input\n\n{state}\n", keys
+
+
+def read_reply(text, keys):
+    """{question id: level or bool} from a judge's reply. The reply may wrap its JSON object in
+    prose or a code fence; the last object with the most keys is read. Anything else raises
+    ValueError: a missing or non-bool veto is never read as false, which would let it pass."""
+    decoder, found, missing = json.JSONDecoder(parse_constant=_no_constant, parse_float=_finite_float), None, None
+    for start in (i for i, ch in enumerate(text) if ch == '{'):
+        try:
+            obj = decoder.raw_decode(text, start)[0]
+        except ValueError:
+            continue
+        gone = [qid for key, (qid, _) in keys.items() if key not in obj] if isinstance(obj, dict) else None
+        if gone is not None and (missing is None or len(gone) <= len(missing)):
+            found, missing = obj, gone
+    if found is None:
+        raise ValueError('the reply has no JSON object')
+    if missing:
+        raise ValueError(f"no answer for {', '.join(missing)}")
+    picks = {}
+    for key, (qid, letters) in keys.items():
+        value = found[key]
+        if letters is None:
+            if type(value) is not bool:
+                raise ValueError(f'no true/false answer for {qid}')
+            picks[qid] = value
+            continue
+        letter = value.strip().strip('()').lower() if isinstance(value, str) else None
+        if letter not in letters:
+            raise ValueError(f'no valid level letter for {qid}')
+        picks[qid] = letters[letter]
+    return picks
+
+
+class CommandJudge:
+    """An LLM acting as Jev through its own command-line tool, with no API bill. Each sample runs
+    one command (round robin over several) with skills/judge/SKILL.md, the questions and the input
+    on stdin, in an empty folder, and reads one pick per question from the reply. Disagreement
+    between samples is the uncertainty: a level's probability is the share of samples that chose
+    it, a Noul's the share that said true. For a judge, sampled agreement tracked human agreement
+    better than a confidence the model states (Jung et al., ICLR 2025: AUROC 0.72 against 0.55),
+    but it is not calibrated either. One sample has no distribution, so its answers carry
+    confidence None, as the Ollama judge's do."""
+    name = 'cmd'
+
+    def __init__(self, commands, samples=5, timeout_s=600.0, max_attempts=2, runner=None):
+        if not commands:
+            raise JudgeError(f"the command judge needs --judge-cmd: a preset ({', '.join(JUDGE_PRESETS)}) "
+                             'or a full command that reads a prompt on stdin')
+        if type(samples) is not int or not 1 <= samples <= 25 or type(max_attempts) is not int or max_attempts < 1 \
+                or not is_number(timeout_s) or timeout_s <= 0:
+            raise ValueError('samples must be 1 to 25, max_attempts at least 1, and timeout_s positive')
+        self.commands = [JUDGE_PRESETS.get(cmd, cmd) for cmd in commands]
+        self.argvs = [shlex.split(cmd) for cmd in self.commands]
+        if not all(self.argvs):
+            raise ValueError('a judge command is empty')
+        self.samples, self.timeout_s, self.max_attempts = samples, timeout_s, max_attempts
+        self.runner = runner or self.run_command
+        self.info = {'commands': self.commands, 'samples': samples, 'timeout_s': timeout_s,
+                     'max_attempts': max_attempts, 'skill_sha256': sha256(SKILL.read_bytes())}
+
+    def run_command(self, argv, prompt):
+        """stdout of one run, in an empty folder so no project instructions, memory or files
+        reach the judge."""
+        # ceiling: stdout is read whole; a command that floods it fills memory
+        with tempfile.TemporaryDirectory(prefix='council-judge-') as cwd:
+            done = subprocess.run(argv, input=prompt, check=False, capture_output=True, text=True, encoding='utf-8',
+                                  errors='replace', cwd=cwd, timeout=self.timeout_s)
+        if done.returncode:
+            tail = ' '.join(done.stderr.split())[-300:]
+            raise JudgeError(f'{Path(argv[0]).name} exited with {done.returncode}' + (f': {tail}' if tail else ''))
+        return done.stdout
+
+    def sample(self, k, prompt, keys):
+        """Sample k's picks and the attempts it took. A failed or unreadable reply is asked again;
+        a command that cannot start stops the run, since every later sample would fail too."""
+        argv, problem = self.argvs[k % len(self.argvs)], ''
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                return read_reply(self.runner(argv, prompt), keys), attempt
+            except OSError as exc:
+                raise JudgeError(f'cannot run the judge command {argv[0]}: {type(exc).__name__}', fatal=True) from None
+            except subprocess.TimeoutExpired:
+                problem = f'no reply within {self.timeout_s:g} s'
+            except (JudgeError, ValueError) as exc:
+                problem = str(exc)
+        raise JudgeError(f'sample {k + 1} ({Path(argv[0]).name}): {problem}')
+
+    def judge(self, brief, proposal, rubric):
+        questions = build_questions(rubric, parse_constraints(brief))
+        jobs = [(k, *judge_prompt(brief, proposal, questions, k)) for k in range(self.samples)]
+        with concurrent.futures.ThreadPoolExecutor(self.samples) as pool:
+            results = list(pool.map(lambda job: self.sample(*job), jobs))
+        picks, k = [r[0] for r in results], self.samples
+        answers = {}
+        for qid, q in questions.items():
+            values = [p[qid] for p in picks]
+            if q['type'] == 'noul':
+                answers[qid] = {'type': 'noul', 'noul': sum(values) / k, **({'confidence': None} if k == 1 else {})}
+                continue
+            probs = {str(i): values.count(i) / k for i in range(len(q['criteria']))}
+            answers[qid] = {'type': 'score', 'score': sum(values) / k, 'probabilities': probs,
+                            'confidence': score_confidence(probs) if k > 1 else None}
+        return {'answers': answers, 'model': ' + '.join(sorted({Path(a[0]).name for a in self.argvs})), 'usage': None,
+                'request_sha256': sha256('\0'.join(job[1] for job in jobs).encode()),
+                'attempts': sum(r[1] for r in results),
+                'samples': [{'command': i % len(self.argvs), 'picks': p} for i, p in enumerate(picks)]}
 
 
 # --- the chairman is code -----------------------------------------------------------
@@ -930,6 +1096,8 @@ def render(report):
     models = sorted({row['model'] for row in report['judged'] if row.get('model')})
     tokens = sum((row.get('usage') or {}).get('input_tokens') or 0 for row in report['judged'])
     head = f"judge: {report['judge']}   model: {', '.join(models) or 'n/a'}   seed: {report['seed']}"
+    samples = (report.get('judge_config') or {}).get('samples')
+    head += f'   samples: {samples}' if samples else ''
     lines = [head + (f'   input tokens: {tokens}' if tokens else ''), '']
     header = f"{'':12}{'total':>7} " + ' '.join(f'{d[:12]:>13}' for d in dims) + '   source'
     lines.append(header)
@@ -1004,10 +1172,15 @@ def parse_args(argv):
             p.add_argument('--seed', type=int, default=0)
             p.add_argument('--typesafe-model', default=DEFAULT_MODEL,
                            help='alias or version; pin a version such as jev-1.13.0 once thresholds are tuned')
+            p.add_argument('--judge', choices=('cmd', 'typesafe', 'ollama'), default='cmd',
+                           help='cmd (default): an LLM through its CLI, no API bill; typesafe: the paid Jev API')
         if name == 'show-request':
             continue
         if name == 'judge':
-            p.add_argument('--judge', choices=('typesafe', 'ollama'), default='typesafe')
+            p.add_argument('--judge-cmd', action='append', metavar='CMD',
+                           help=f"a preset ({', '.join(JUDGE_PRESETS)}) or a command that reads the prompt on stdin; "
+                                'repeat it for a panel, sampled in turn')
+            p.add_argument('--samples', type=int, default=5, help='runs per proposal for the cmd judge (default 5)')
             p.add_argument('--ollama-url', default='http://localhost:11434')
             p.add_argument('--ollama-model', default='qwen2.5:7b')
         p.add_argument('--out', help='write the full JSON report here (judge: also after each proposal)')
@@ -1082,12 +1255,16 @@ def run(parser, args, out):
     if args.command == 'show-request':
         for item in anonymised:
             print(f"# {item['label']}  <- {item['source']}", file=out)
-            print(json.dumps(build_request(brief, item['text'], rubric, args.typesafe_model), indent=2), file=out)
+            if args.judge == 'cmd':  # the first sample's prompt; later samples reorder questions and levels
+                print(judge_prompt(brief, item['text'], build_questions(rubric, constraints), 0)[0], file=out)
+            else:
+                print(json.dumps(build_request(brief, item['text'], rubric, args.typesafe_model), indent=2), file=out)
         return 0
     mandatory = check_mandatory(args.mandatory or [], constraints, rubric)
     try:
         judge = (TypeSafeJudge(model=args.typesafe_model) if args.judge == 'typesafe'
-                 else OllamaJudge(args.ollama_url, args.ollama_model))
+                 else OllamaJudge(args.ollama_url, args.ollama_model) if args.judge == 'ollama'
+                 else CommandJudge(args.judge_cmd, args.samples))
     except JudgeError as exc:
         print(f'cannot start judge: {exc}', file=sys.stderr)
         return 2

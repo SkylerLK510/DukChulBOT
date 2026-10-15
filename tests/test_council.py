@@ -2,6 +2,8 @@
 import http.client
 import io
 import json
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -558,6 +560,160 @@ class OllamaJudgeTests(unittest.TestCase):
             c.OllamaJudge('file:///etc/passwd')
 
 
+LEVEL_OF = {text: (d['id'], i) for d in rubric()['dimensions'] for i, text in enumerate(d.get('levels', []))}
+QUESTION = re.compile(r'^- (q\d+), (pick one letter|true or false): (.*)$', re.MULTILINE)
+OPTION = re.compile(r'\(([a-z])\) (.*?)(?=; \([a-z]\) |$)')
+
+
+def fake_cli(levels=None, constraints=True, vetoes=None, drop=(), wrap=lambda reply: reply):
+    """A runner that answers a cmd-judge prompt the way a model would: it reads each question
+    line and picks a level by its TEXT, so letters, reversal and order are exercised rather
+    than assumed. levels: {dimension_id: level} (default top); vetoes: {veto_id: bool}."""
+    def run(argv, prompt):
+        reply = {}
+        for key, kind, line in QUESTION.findall(prompt):
+            if kind == 'pick one letter':
+                options = OPTION.findall(line.split(' Levels: ', 1)[1])
+                dim = LEVEL_OF[options[0][1]][0]
+                want = (levels or {}).get(dim, TOPS.get(dim, 3))
+                reply[key] = next(letter for letter, text in options if LEVEL_OF[text] == (dim, want))
+                continue
+            veto = next((v['id'] for v in rubric()['vetoes'] if v['instructions'] in line), None)
+            if veto in drop:
+                continue
+            reply[key] = (vetoes or {}).get(veto, False) if veto else constraints
+        return wrap(json.dumps(reply))
+    return run
+
+
+class CommandJudgeTests(unittest.TestCase):
+    def judge(self, runner, samples=5, commands=('fake',), **kw):
+        return c.CommandJudge(list(commands), samples, runner=runner, **kw).judge(BRIEF, 'text', rubric())
+
+    def test_letters_and_reversed_levels_map_back_to_the_rubric(self):
+        row = self.judge(fake_cli(), samples=4)  # even samples forward, odd ones reversed
+        for d in rubric()['dimensions']:
+            if 'levels' in d:
+                a, top = row['answers'][d['id']], len(d['levels']) - 1
+                self.assertEqual((a['score'], a['confidence']), (top, 1.0), d['id'])
+                self.assertEqual(a['probabilities'][str(top)], 1.0)
+        self.assertEqual(row['answers']['constraint_fit.1'], {'type': 'noul', 'noul': 1.0})
+        self.assertEqual(row['answers']['violates_hard_constraint'], {'type': 'noul', 'noul': 0.0})
+        self.assertEqual((len(row['samples']), row['attempts'], row['model']), (4, 4, 'fake'))
+
+    def test_disagreement_between_samples_becomes_the_distribution(self):
+        good, unsure = fake_cli(), fake_cli(levels={'failure_handling': 2}, vetoes={'violates_hard_constraint': True})
+        row = self.judge(lambda argv, prompt: (good if argv[0] == 'a' else unsure)(argv, prompt), commands=('a', 'b'))
+        fh = row['answers']['failure_handling']  # samples 0, 2, 4 ask a; 1 and 3 ask b
+        self.assertEqual(fh['probabilities'], {'0': 0.0, '1': 0.0, '2': 0.4, '3': 0.6})
+        self.assertAlmostEqual(fh['score'], 2.6)
+        self.assertAlmostEqual(fh['confidence'], 0.6)  # 1 - 0.4 / 1.0
+        self.assertAlmostEqual(row['answers']['violates_hard_constraint']['noul'], 0.4)
+        self.assertEqual([s['command'] for s in row['samples']], [0, 1, 0, 1, 0])
+        self.assertEqual(row['model'], 'a + b')
+        self.assertIsNone(c.check_score(fh, 3))
+
+    def test_score_confidence_reproduces_jev_on_the_live_run(self):
+        live = json.loads((EXAMPLE / 'live-run.jev-1.13.0.json').read_text())
+        checked = 0
+        for row in live['judged']:
+            for a in row['answers'].values():
+                if a['type'] == 'score':
+                    self.assertLessEqual(abs(c.score_confidence(a['probabilities']) - a['confidence']), 0.0101)
+                    checked += 1
+        self.assertEqual(checked, 15)
+
+    def test_tied_most_likely_levels_take_the_less_certain_reading(self):
+        self.assertAlmostEqual(c.score_confidence({'0': 0, '1': 0.4, '2': 0.4, '3': 0.2}), 0.2)
+
+    def test_a_reply_wrapped_in_prose_and_a_fence_is_read(self):
+        row = self.judge(fake_cli(wrap=lambda r: f'Here is my answer:\n```json\n{r}\n```\nDone.'), samples=1)
+        self.assertEqual(row['answers']['failure_handling']['score'], 3)
+
+    def test_an_omitted_veto_is_asked_again_then_fails_rather_than_passing(self):
+        calls = []
+
+        def runner(argv, prompt):
+            calls.append(argv)
+            return fake_cli(drop={'violates_hard_constraint'})(argv, prompt)
+
+        with self.assertRaises(c.JudgeError) as caught:
+            self.judge(runner, samples=1)
+        self.assertIn('no answer for violates_hard_constraint', str(caught.exception))
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(caught.exception.fatal)
+
+    def test_a_bad_reply_or_a_timeout_is_asked_again(self):
+        replies = iter(['I would rather not.', subprocess.TimeoutExpired('x', 1)])
+
+        def runner(argv, prompt):
+            reply = next(replies, None)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply if reply is not None else fake_cli()(argv, prompt)
+
+        with self.assertRaises(c.JudgeError) as caught:
+            self.judge(runner, samples=1)
+        self.assertIn('no reply within 600 s', str(caught.exception))
+        self.assertEqual(self.judge(runner, samples=1)['attempts'], 1)  # the iterator is spent: answers at once
+        replies = iter(['{"q1": "zz"}'])
+        self.assertEqual(self.judge(runner, samples=1)['attempts'], 2)
+
+    def test_one_sample_reports_no_distribution(self):
+        row = self.judge(fake_cli(), samples=1)
+        self.assertTrue(all(c.no_uncertainty(a) for a in row['answers'].values()))
+
+    def test_a_command_that_cannot_start_stops_the_run(self):
+        with self.assertRaises(c.JudgeError) as caught:
+            c.CommandJudge(['no-such-council-judge-binary'], 1).judge(BRIEF, 'text', rubric())
+        self.assertTrue(caught.exception.fatal)
+
+    def test_the_command_gets_the_prompt_on_stdin_in_an_empty_folder(self):
+        script = ("import os, re, sys, json\n"
+                  "if os.listdir('.'): sys.exit(3)\n"
+                  "p = sys.stdin.read()\n"
+                  "print(json.dumps({k: ('a' if t == 'pick one letter' else False) "
+                  "for k, t in re.findall(r'^- (q\\d+), (pick one letter|true or false):', p, re.M)}))\n")
+        row = c.CommandJudge([shlex.join([sys.executable, '-c', script])], 2).judge(BRIEF, 'text', rubric())
+        fh = row['answers']['failure_handling']  # 'a' is the lowest level forward and the top one reversed
+        self.assertEqual(fh['probabilities'], {'0': 0.5, '1': 0.0, '2': 0.0, '3': 0.5})
+        self.assertEqual(set(row['answers']), set(c.build_questions(rubric(), c.parse_constraints(BRIEF))))
+
+    def test_a_failing_command_is_reported_with_its_stderr(self):
+        failing = shlex.join([sys.executable, '-c', 'import sys; sys.stderr.write("quota hit"); sys.exit(1)'])
+        with self.assertRaises(c.JudgeError) as caught:
+            c.CommandJudge([failing], 1).judge(BRIEF, 'text', rubric())
+        self.assertIn('exited with 1: quota hit', str(caught.exception))
+
+    def test_the_prompt_hides_rubric_ids_and_varies_order_between_samples(self):
+        questions = c.build_questions(rubric(), c.parse_constraints(BRIEF))
+        prompts = [c.judge_prompt(BRIEF, 'the proposal', questions, k)[0] for k in range(3)]
+        for prompt in prompts:
+            for qid in questions:
+                self.assertNotIn(qid.split('.')[0], prompt)
+            self.assertIn('"proposal": "the proposal"', prompt)
+            self.assertFalse(prompt.startswith('---'))
+        lines = [[line[line.index(':'):] for line in QUESTION.findall(p) and p.splitlines() if line.startswith('- q')]
+                 for p in prompts]
+        self.assertNotEqual(lines[0], lines[2])  # question order shuffled
+        fh = [next(line for line in p.splitlines() if 'deal with things going wrong' in line) for p in prompts[:2]]
+        self.assertIn('(a) Does not mention failure at all', fh[0])
+        self.assertIn('(d) Does not mention failure at all', fh[1])  # levels reversed
+
+    def test_bad_settings_are_refused_and_presets_expand(self):
+        with self.assertRaises(c.JudgeError):
+            c.CommandJudge([], 5)
+        for bad in ({'samples': 0}, {'samples': True}, {'samples': 26}, {'max_attempts': 0}, {'timeout_s': 0}):
+            with self.assertRaises(ValueError, msg=bad):
+                c.CommandJudge(['x'], **{'samples': 5, **bad})
+        with self.assertRaises(ValueError):
+            c.CommandJudge(['  '], 5)
+        judge = c.CommandJudge(['claude', 'codex'], 5)
+        self.assertTrue(judge.commands[0].startswith('claude -p --setting-sources project'))
+        self.assertIn('--tools', judge.argvs[0])
+        self.assertEqual(judge.info['skill_sha256'], c.sha256(c.SKILL.read_bytes()))
+
+
 class AnswerValidationTests(unittest.TestCase):
     def row(self, mutate):
         a = flat(2)
@@ -638,7 +794,7 @@ class PolicyTests(unittest.TestCase):
 
         err = io.StringIO()
         with mock.patch.object(c, 'TypeSafeJudge', Empty), mock.patch.object(c.sys, 'stderr', err):
-            self.assertEqual(c.main(['judge', *CliTests.ARGS], out=io.StringIO()), 2)
+            self.assertEqual(c.main(['judge', '--judge', 'typesafe', *CliTests.ARGS], out=io.StringIO()), 2)
         self.assertIn('no proposal could be judged', err.getvalue())
 
     def test_a_sole_survivor_must_clear_the_floor(self):
@@ -793,7 +949,7 @@ class CheckpointAndJournalTests(unittest.TestCase):
         out = self.dir / 'run.json'
         err = io.StringIO()
         with mock.patch.object(c, 'TypeSafeJudge', StopsOnSecond), mock.patch.object(c.sys, 'stderr', err):
-            code = c.main(['judge', *CliTests.ARGS, '--out', str(out)], out=io.StringIO())
+            code = c.main(['judge', '--judge', 'typesafe', *CliTests.ARGS, '--out', str(out)], out=io.StringIO())
         self.assertEqual(code, 2)
         self.assertIn('HTTP 401', err.getvalue())
         saved = json.loads(out.read_text())
@@ -829,9 +985,9 @@ class CheckpointAndJournalTests(unittest.TestCase):
         fake = self.fake_judge(lambda proposal: unsure)
         with mock.patch.object(c, 'TypeSafeJudge', fake), mock.patch.object(c, 'write_json', spy), \
                 mock.patch.object(c.sys, 'stderr', io.StringIO()):
-            self.assertEqual(c.main(['judge', *CliTests.ARGS, '--out', str(out), '--mandatory', '2'], out=io.StringIO()), 1)
+            self.assertEqual(c.main(['judge', '--judge', 'typesafe', *CliTests.ARGS, '--out', str(out), '--mandatory', '2'], out=io.StringIO()), 1)
             self.assertEqual(writes, [(0, False), (1, False), (2, False), (3, False), (3, True)])
-            self.assertEqual(c.main(['judge', *CliTests.ARGS, '--allow-missing-confidence'], out=io.StringIO()), 1)
+            self.assertEqual(c.main(['judge', '--judge', 'typesafe', *CliTests.ARGS, '--allow-missing-confidence'], out=io.StringIO()), 1)
         saved = json.loads(out.read_text())
         self.assertEqual(saved['mandatory_constraints'], [2])
         self.assertTrue(any('mandatory constraint 2 cannot be checked' in r for r in saved['shadow']['reasons']))
@@ -903,7 +1059,7 @@ class CheckpointAndJournalTests(unittest.TestCase):
                 return {'answers': good if 'left' in proposal else poor, 'model': 'fake', 'usage': None}
 
         with mock.patch.object(c, 'TypeSafeJudge', ByText), mock.patch.object(c.sys, 'stderr', io.StringIO()):
-            self.assertEqual(c.main(['judge', '--brief', str(brief), '--proposals', str(self.dir / 'left' / 'option.md'),
+            self.assertEqual(c.main(['judge', '--judge', 'typesafe', '--brief', str(brief), '--proposals', str(self.dir / 'left' / 'option.md'),
                                      str(self.dir / 'right' / 'option.md'), '--out', str(report),
                                      '--journal', str(journal)], out=io.StringIO()), 0)
         c.main(['label', '--journal', str(journal), '--brief', str(brief), '--pick', str(self.dir / 'right' / 'option.md')])
@@ -970,7 +1126,7 @@ class CliTests(unittest.TestCase):
     def test_show_request_prints_every_payload_and_touches_no_network(self):
         out = io.StringIO()
         with mock.patch.object(c.urllib.request, 'urlopen', side_effect=AssertionError('no network allowed')):
-            self.assertEqual(c.main(['show-request', *self.ARGS], out=out), 0)
+            self.assertEqual(c.main(['show-request', '--judge', 'typesafe', *self.ARGS], out=out), 0)
         text = out.getvalue()
         self.assertEqual(text.count('"model": "jev-latest"'), 3)
         self.assertIn('Remote access to the desktop is NOT configured', text)
@@ -978,7 +1134,7 @@ class CliTests(unittest.TestCase):
     def test_a_glob_that_matches_the_brief_leaves_it_out(self):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(c.sys, 'stderr', err):
-            self.assertEqual(c.main(['show-request', '--brief', str(EXAMPLE / 'brief.md'), '--proposals',
+            self.assertEqual(c.main(['show-request', '--judge', 'typesafe', '--brief', str(EXAMPLE / 'brief.md'), '--proposals',
                                      *map(str, sorted(EXAMPLE.glob('*.md')))], out=out), 0)
         self.assertEqual(out.getvalue().count('"state"'), 3)
         self.assertNotIn('<- brief.md', out.getvalue())
@@ -987,7 +1143,7 @@ class CliTests(unittest.TestCase):
 
     def test_show_request_can_pin_a_model_version(self):
         out = io.StringIO()
-        self.assertEqual(c.main(['show-request', '--typesafe-model', 'jev-1.13.0', *self.ARGS], out=out), 0)
+        self.assertEqual(c.main(['show-request', '--judge', 'typesafe', '--typesafe-model', 'jev-1.13.0', *self.ARGS], out=out), 0)
         self.assertEqual(out.getvalue().count('"model": "jev-1.13.0"'), 3)
 
     def test_report_names_the_model_that_answered_and_the_tokens_used(self):
@@ -1036,7 +1192,7 @@ class CliTests(unittest.TestCase):
                 raise c.JudgeError('TypeSafe API unreachable: URLError')
 
         with mock.patch.object(c, 'TypeSafeJudge', Down), mock.patch.object(c.sys, 'stderr', io.StringIO()):
-            self.assertEqual(c.main(['judge', *self.ARGS], out=io.StringIO()), 2)
+            self.assertEqual(c.main(['judge', '--judge', 'typesafe', *self.ARGS], out=io.StringIO()), 2)
 
     def test_runs_under_python_dash_OO(self):
         done = subprocess.run([sys.executable, '-OO', str(ROOT / 'council.py'), '--help'], capture_output=True, text=True)
@@ -1047,10 +1203,37 @@ class CliTests(unittest.TestCase):
         c.main(['rescore', '--report', str(EXAMPLE / 'live-run.jev-1.13.0.json'), '--rubric', str(c.DEFAULT_RUBRIC)], out=out)
         self.assertEqual(out.getvalue(), (ROOT / 'tests' / 'golden' / 'live-run.rescore.txt').read_text(encoding='utf-8'))
 
+    def test_the_cmd_judge_is_the_default_and_needs_a_command(self):
+        err = io.StringIO()
+        with mock.patch.object(c.sys, 'stderr', err):
+            self.assertEqual(c.main(['judge', *self.ARGS], out=io.StringIO()), 2)
+        self.assertIn('--judge-cmd', err.getvalue())
+
+    def test_show_request_prints_the_cmd_judge_prompt(self):
+        out = io.StringIO()
+        with mock.patch.object(c.subprocess, 'run', side_effect=AssertionError('no judge call allowed')):
+            self.assertEqual(c.main(['show-request', *self.ARGS], out=out), 0)
+        self.assertEqual(out.getvalue().count('## Questions'), 3)
+        self.assertIn('Remote access to the desktop is NOT configured', out.getvalue())
+
+    def test_cmd_judge_end_to_end_through_the_cli_and_rescore(self):
+        out, report = io.StringIO(), Path(tempfile.mkdtemp()) / 'run.json'
+        with mock.patch.object(c.CommandJudge, 'run_command', lambda self, argv, prompt: fake_cli()(argv, prompt)), \
+                mock.patch.object(c.sys, 'stderr', io.StringIO()):
+            code = c.main(['judge', '--judge-cmd', 'fake', '--samples', '3', *self.ARGS, '--out', str(report)], out=out)
+        saved = json.loads(report.read_text())
+        self.assertEqual((saved['judge'], saved['judge_config']['samples'], saved['complete']), ('cmd', 3, True))
+        self.assertTrue(all(len(row['samples']) == 3 for row in saved['judged']))
+        self.assertIn('samples: 3', out.getvalue().splitlines()[0])
+        self.assertEqual(code, 0 if saved['decision']['action'] == 'recommend' else 1)
+        with mock.patch.object(c.sys, 'stderr', io.StringIO()):
+            self.assertEqual(c.main(['rescore', '--report', str(report), '--rubric', str(c.DEFAULT_RUBRIC)],
+                                    out=io.StringIO()), code)
+
     def test_judge_without_a_key_exits_2_and_says_why(self):
         err = io.StringIO()
         with mock.patch.dict(c.os.environ, {}, clear=True), mock.patch.object(c.sys, 'stderr', err):
-            self.assertEqual(c.main(['judge', *self.ARGS], out=io.StringIO()), 2)
+            self.assertEqual(c.main(['judge', '--judge', 'typesafe', *self.ARGS], out=io.StringIO()), 2)
         self.assertIn('TYPESAFE_API_KEY is not set', err.getvalue())
 
 
