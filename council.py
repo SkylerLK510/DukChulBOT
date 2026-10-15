@@ -32,10 +32,12 @@ import random
 import re
 import string
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from fractions import Fraction
 from itertools import accumulate
 from pathlib import Path
 
@@ -49,6 +51,7 @@ TOOL_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 RETRYABLE = frozenset({408, 429, *range(500, 600)})
 FATAL = (401, 403)  # the key is refused: every later request would be too
 MAX_BODY = 4 * 1024 * 1024  # bytes read from any response
+MAX_OUTCOMES = 50_000  # distinct totals per proposal the shadow gate enumerates before it gives up
 # Decision rules, their defaults and their ranges. Every value is a starting point, not a
 # finding: min_total, max_flip and veto_band in particular are uncalibrated placeholders.
 DECISION_RULES = (('min_confidence', 0.5), ('min_margin', 0.05), ('min_total', 0.25),
@@ -68,10 +71,18 @@ def _no_constant(name):
     raise ValueError(f'{name} is not a JSON number')
 
 
+def _finite_float(text):
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f'{text} is not a finite number')
+    return value
+
+
 def loads(text):
-    """json.loads that refuses NaN and Infinity. Python accepts them by default, and a
-    NaN slips past every threshold (NaN >= 0.7 is False, so a NaN veto never fires)."""
-    return json.loads(text, parse_constant=_no_constant)
+    """json.loads that refuses NaN, Infinity and literals such as 1e400 that overflow to
+    infinity. Python accepts them by default, and a NaN slips past every threshold
+    (NaN >= 0.7 is False, so a NaN veto never fires)."""
+    return json.loads(text, parse_constant=_no_constant, parse_float=_finite_float)
 
 
 def is_number(x, lo=-math.inf, hi=math.inf):
@@ -88,16 +99,17 @@ def now_utc():
 
 
 def retry_delay_s(headers, attempt, rand=random.random):
-    """The server's numeric Retry-After when it sends one, otherwise TypeSafe's SDK
-    backoff: 0.5 s doubling to at most 5 s, with up to a quarter randomly taken off so
-    retries spread out. A date-valued or missing header falls back. The caller's
-    deadline caps both."""
-    try:
-        seconds = float((headers or {}).get('Retry-After'))
-    except (TypeError, ValueError):
-        seconds = float('nan')
-    if seconds >= 0:  # False for NaN
-        return seconds
+    """The server's numeric `retry-after-ms` or `Retry-After` when it sends one (the
+    headers TypeSafe's SDK honours), otherwise the SDK's backoff: 0.5 s doubling to at
+    most 5 s, with up to a quarter randomly taken off so retries spread out. A
+    date-valued or missing header falls back. The caller's deadline caps both."""
+    for name, scale in (('retry-after-ms', 0.001), ('Retry-After', 1.0)):
+        try:
+            seconds = float((headers or {}).get(name)) * scale
+        except (TypeError, ValueError):
+            continue
+        if seconds >= 0:  # False for NaN
+            return seconds
     return min(0.5 * 2 ** (attempt - 1), 5.0) * (1 - 0.25 * rand())
 
 
@@ -111,9 +123,9 @@ def error_detail(exc, secret=None):
         text = ''
     finally:
         exc.close()
-    text = ' '.join(text.split())[:300]
     if secret:
-        text = text.replace(secret, '***')
+        text = text.replace(secret, '***')  # before shortening, so no fragment of the key survives
+    text = ' '.join(text.split())[:300]
     return f': {text}' if text else ''
 
 
@@ -133,7 +145,7 @@ def load_rubric(path):
     if not dims:
         raise ValueError('rubric needs at least one dimension')
     ids = [d.get('id') for d in dims] + [v.get('id') for v in vetoes]
-    if len(set(ids)) != len(ids) or not all(isinstance(i, str) and i and '.' not in i for i in ids):
+    if not all(isinstance(i, str) and i and '.' not in i for i in ids) or len(set(ids)) != len(ids):
         raise ValueError('dimension and veto ids must be unique non-empty strings without dots')
     for d in dims:
         if not is_number(d.get('weight')) or d['weight'] <= 0:
@@ -141,7 +153,8 @@ def load_rubric(path):
         if 'per_constraint' in d:
             if 'levels' in d:
                 raise ValueError(f"{d['id']}: use either levels or per_constraint, not both")
-            question = (d['per_constraint'] or {}).get('question')
+            spec = d['per_constraint']
+            question = spec.get('question') if isinstance(spec, dict) else None
             if not isinstance(question, str) or '`constraint`' not in question:
                 raise ValueError(f"{d['id']}: per_constraint needs a question that refers to `constraint`")
             continue
@@ -150,6 +163,8 @@ def load_rubric(path):
             raise ValueError(f"{d['id']}: a Score takes 2 to 10 levels, each a non-empty string")
         if not d.get('instructions'):
             raise ValueError(f"{d['id']}: instructions are required")
+    if not math.isfinite(sum(d['weight'] for d in dims)):
+        raise ValueError('the weights must add up to a finite number')
     for v in vetoes:
         if not v.get('instructions') or not is_number(v.get('threshold'), 0, 1) or v['threshold'] == 0:
             raise ValueError(f"{v['id']}: veto needs instructions and a threshold in (0, 1]")
@@ -169,7 +184,7 @@ HEADING = re.compile(r'^\s{0,3}(?:#{1,6}\s*)?[*_]{0,2}\s*hard\s+constraints?\s*(
                      r'\s*[*_]{0,2}\s*#*\s*$', re.IGNORECASE)
 BULLET = re.compile(r'^(\s*)(?:[-*+]|\d+[.)])\s+(.*\S)\s*$')
 THEMATIC_BREAK = re.compile(r'^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$')
-FENCE = re.compile(r'^\s*(`{3,}|~{3,})')
+FENCE = re.compile(r'^(\s*)(`{3,}(?=[^`]*$)|~{3,})')  # a backtick fence's info string has no backticks
 
 
 def parse_constraints(brief):
@@ -180,18 +195,22 @@ def parse_constraints(brief):
     are fine. After a blank line an unindented line ends the list, and so does a heading,
     a horizontal rule or an unindented code fence. Nothing inside a code fence counts,
     so a brief can quote an example. No such section gives []."""
-    constraints, inside, indent, after_blank, fence = [], False, None, False, None
+    constraints, inside, indent, after_blank, fence, fence_indent = [], False, None, False, None, 0
     # CommonMark's line endings only: str.splitlines also splits on U+2028, U+001E and others.
     for line in re.split(r'\r\n|\r|\n', brief):
         opener = FENCE.match(line)
         if fence:
-            if opener and opener.group(1)[0] == fence[0] and len(opener.group(1)) >= len(fence) \
+            if opener and opener.group(2)[0] == fence[0] and len(opener.group(2)) >= len(fence) \
                     and not line[opener.end():].strip():
                 fence = None
-            continue
+                continue
+            # a fence inside a bullet ends with the bullet: a line indented less than the fence closes it
+            if not line.strip() or len(line) - len(line.lstrip()) >= fence_indent or not fence_indent:
+                continue
+            fence = None
         if opener:
-            fence = opener.group(1)
-            if inside and indent is not None and not line[:1].isspace():
+            fence, fence_indent = opener.group(2), len(opener.group(1))
+            if inside and indent is not None and not fence_indent:
                 inside = False
             continue
         if HEADING.match(line):
@@ -276,7 +295,7 @@ def anonymise(proposals, seed=0):
 class TypeSafeJudge:
     name = 'typesafe'
 
-    def __init__(self, api_key=None, url=TYPESAFE_URL, model=DEFAULT_MODEL, timeout_s=30.0, deadline_s=60.0,
+    def __init__(self, api_key=None, url=TYPESAFE_URL, model=DEFAULT_MODEL, timeout_s=60.0, deadline_s=60.0,
                  max_attempts=3, opener=urllib.request.urlopen, sleep=time.sleep, clock=time.monotonic,
                  rand=random.random):
         self.api_key = api_key or os.environ.get('TYPESAFE_API_KEY')
@@ -322,8 +341,11 @@ class TypeSafeJudge:
                 if attempt == self.max_attempts:
                     raise JudgeError(failure) from None
                 delay = retry_delay_s(None, attempt, self.rand)
-            except ValueError:  # bad JSON, bad UTF-8, NaN
-                raise JudgeError('TypeSafe API returned a body that is not valid JSON') from None
+            except ValueError:  # bad JSON, bad UTF-8 or NaN; also a body cut short that had no Content-Length
+                failure = 'TypeSafe API returned a body that is not valid JSON'
+                if attempt == self.max_attempts:
+                    raise JudgeError(failure) from None
+                delay = retry_delay_s(None, attempt, self.rand)
             if self.clock() + delay >= deadline:
                 raise JudgeError(f'{failure}; waiting {delay:g} s to retry would pass the {self.deadline_s:g} s deadline')
             self.sleep(delay)
@@ -466,12 +488,16 @@ def check_noul(answer):
     return None
 
 
+def no_uncertainty(answer):
+    """The judge says it cannot report uncertainty (`"confidence": null`, as the Ollama
+    judge does), so its probabilities are picks, not distributions."""
+    return 'confidence' in answer and answer['confidence'] is None
+
+
 def noul_confidence(answer):
     """|2p - 1|, TypeSafe's documented confidence for a Noul: 0 at p = 0.5, 1 at p = 0
-    or 1. None when the judge says it cannot report uncertainty."""
-    if 'confidence' in answer and answer['confidence'] is None:
-        return None
-    return abs(2 * answer['noul'] - 1)
+    or 1. None when the judge cannot report uncertainty."""
+    return None if no_uncertainty(answer) else abs(2 * answer['noul'] - 1)
 
 
 def score_per_constraint(d, answers, constraints, problems):
@@ -489,9 +515,10 @@ def score_per_constraint(d, answers, constraints, problems):
         problems.append(f"{d['id']} needs the brief's hard constraints and there are none")
     if len(found) < len(constraints) or not constraints:
         return None
-    known = [c['confidence'] for c in found]
+    known = [c['confidence'] for c in found if c['confidence'] is not None]
     return {'normalised': sum(c['probability'] for c in found) / len(found),
-            'confidence': None if None in known else min(known), 'constraints': found}
+            'confidence': min(known) if known else None, 'confidence_missing': len(known) < len(found),
+            'constraints': found}
 
 
 def score_row(row, rubric, constraints=()):
@@ -531,7 +558,7 @@ def score_row(row, rubric, constraints=()):
     lowest = min(known, key=lambda c: c[0]) if known else (None, None)
     return {'label': row['label'], 'source': row['source'], 'total': total, 'dimensions': dims, 'vetoes': vetoes,
             'min_confidence': lowest[0], 'min_confidence_at': lowest[1],
-            'no_confidence': [k for k, dim in dims.items() if dim['confidence'] is None]}
+            'no_confidence': [k for k, dim in dims.items() if dim['confidence'] is None or dim.get('confidence_missing')]}
 
 
 def decide(scored, rubric):
@@ -585,39 +612,45 @@ def decide(scored, rubric):
 def answer_distributions(row, rubric, constraints):
     """A proposal's total as independent pieces, [(weight share, [(value, p), ...])]: one
     per Score (its levels) and one per constraint question (0 or 1). Vetoes are held
-    fixed. None when the judge gave no real distribution (it reports no confidence)."""
-    total_weight, items = sum(d['weight'] for d in rubric['dimensions']), []
+    fixed. Shares and values are exact fractions (a weight of 0.15 is 3/20), so totals
+    that are equal on paper compare equal and tie. None when the judge cannot report
+    uncertainty, so its probabilities are picks rather than distributions."""
+    weights = {d['id']: Fraction(repr(d['weight'])) for d in rubric['dimensions']}
+    total_weight, items = sum(weights.values()), []
     for d in rubric['dimensions']:
+        share = weights[d['id']] / total_weight
         if 'per_constraint' in d:
             for qid in per_constraint_ids(d, constraints):
                 answer = row['answers'][qid]
-                if noul_confidence(answer) is None:
+                if no_uncertainty(answer):
                     return None
-                items.append((d['weight'] / total_weight / len(constraints),
-                              [(0.0, 1 - answer['noul']), (1.0, answer['noul'])]))
+                items.append((share / len(constraints), [(Fraction(0), 1 - answer['noul']), (Fraction(1), answer['noul'])]))
         else:
             answer, top = row['answers'][d['id']], len(d['levels']) - 1
-            if answer.get('confidence') is None:
+            if no_uncertainty(answer):
                 return None
             mass = sum(answer['probabilities'].values())
-            items.append((d['weight'] / total_weight,
-                          [(int(k) / top, p / mass) for k, p in answer['probabilities'].items()]))
+            items.append((share, [(Fraction(int(k), top), p / mass) for k, p in answer['probabilities'].items()]))
     return items
 
 
 def total_distribution(items, together=False):
     """The exact distribution of a proposal's total, as sorted [(total, p)]. Independent
     answers are convolved. `together` is the stress case: every answer of the proposal
-    follows one shared draw, so they are all good or all bad at once."""
+    follows one shared draw, so they are all good or all bad at once. None when the
+    total has more than MAX_OUTCOMES distinct values (a rubric with many fine-grained
+    dimensions); the shadow gate then reports ranking uncertainty as unavailable."""
     dist = defaultdict(float)
     if not together:
-        dist[0.0] = 1.0
+        dist[Fraction(0)] = 1.0
         for weight, outcomes in items:
             step = defaultdict(float)
             for total, p in dist.items():
                 for value, q in outcomes:
                     if q:
-                        step[round(total + weight * value, 9)] += p * q
+                        step[total + weight * value] += p * q
+            if len(step) > MAX_OUTCOMES:
+                return None
             dist = step
         return sorted(dist.items())
     ladders = []
@@ -628,7 +661,7 @@ def total_distribution(items, together=False):
     for a, b in zip(cuts, cuts[1:]):
         u = (a + b) / 2  # between two cuts every answer sits on one outcome
         total = sum(w * values[min(bisect.bisect_right(cdf, u), len(values) - 1)] for w, values, cdf in ladders)
-        dist[round(total, 9)] += b - a
+        dist[total] += b - a
     return sorted(dist.items())
 
 
@@ -694,15 +727,18 @@ def shadow_gate(judged, scored, rubric, constraints, mandatory=()):
         if margin < rule['min_margin']:
             reasons.append(f"{winner['label']} leads {runner_up['label']} by {margin:.4f}, below min_margin {rule['min_margin']}")
         items = {s['label']: answer_distributions(rows[s['label']], rubric, constraints) for s in eligible}
-        if any(v is None for v in items.values()):
-            ranking['unavailable'] = 'the judge gave no probability distributions'
-            reasons.append('ranking uncertainty unavailable: the judge gave no probability distributions')
+        dists = {} if any(v is None for v in items.values()) else {
+            (label, together): total_distribution(it, together) for label, it in items.items() for together in (False, True)}
+        if not dists or any(v is None for v in dists.values()):
+            why = ('the judge reports no uncertainty, so its probabilities are picks' if not dists
+                   else f'more than {MAX_OUTCOMES} possible totals to enumerate exactly')
+            ranking['unavailable'] = why
+            reasons.append(f'ranking uncertainty unavailable: {why}')
         else:
             for suffix, together in (('', False), ('_together', True)):
-                dists = {label: total_distribution(it, together) for label, it in items.items()}
-                others = [d for label, d in dists.items() if label != winner['label']]
-                ranking['p_flip' + suffix] = flip_probability(dists[winner['label']], others)
-                ranking['expected_loss' + suffix] = expected_loss(dists[winner['label']], others)
+                others = [d for (label, t), d in dists.items() if t == together and label != winner['label']]
+                ranking['p_flip' + suffix] = flip_probability(dists[winner['label'], together], others)
+                ranking['expected_loss' + suffix] = expected_loss(dists[winner['label'], together], others)
             if ranking['p_flip'] > rule['max_flip']:
                 reasons.append(f"P(ranking flips) is {ranking['p_flip']:.3f}, above max_flip {rule['max_flip']}")
     band = rule['veto_band']
@@ -723,7 +759,10 @@ def shadow_gate(judged, scored, rubric, constraints, mandatory=()):
     for d in (d for d in rubric['dimensions'] if 'per_constraint' in d):
         for i in mandatory:
             c = winner['dimensions'][d['id']]['constraints'][i - 1]
-            if c['probability'] < need:
+            if c['confidence'] is None:
+                reasons.append(f"mandatory constraint {i} cannot be checked on {winner['label']}: the judge reports "
+                               f"no confidence on {d['id']} for \"{c['constraint']}\"")
+            elif c['probability'] < need:
                 reasons.append(f"mandatory constraint {i} is open on {winner['label']}: p={c['probability']:.2f} on "
                                f"{d['id']} for \"{c['constraint']}\", below {need:.2f}")
     return {'action': 'escalate' if reasons else 'recommend', 'recommendation': winner['label'],
@@ -741,21 +780,29 @@ def check_mandatory(mandatory, constraints, rubric):
 
 
 def build_report(brief, judged, rubric, judge_name, seed, judge_info=None, mandatory=(), complete=True):
+    """The full report, or with complete=False a checkpoint: the raw answers and their
+    provenance only, so saving them never waits on scoring."""
     constraints = parse_constraints(brief)
-    scored = [score_row(row, rubric, constraints) for row in judged]
-    return {'schema_version': SCHEMA_VERSION, 'complete': complete, 'created_at': now_utc(),
-            'tool_sha256': TOOL_SHA256, 'python': platform.python_version(), 'judge': judge_name,
-            'judge_config': judge_info or {}, 'seed': seed, 'brief_sha256': sha256(brief.encode()),
-            'constraints': constraints, 'mandatory_constraints': list(mandatory), 'rubric': rubric,
-            'judged': judged, 'scored': scored, 'decision': decide(scored, rubric),
-            'shadow': shadow_gate(judged, scored, rubric, constraints, mandatory)}
+    report = {'schema_version': SCHEMA_VERSION, 'complete': complete, 'created_at': now_utc(),
+              'tool_sha256': TOOL_SHA256, 'python': platform.python_version(), 'judge': judge_name,
+              'judge_config': judge_info or {}, 'seed': seed, 'brief_sha256': sha256(brief.encode()),
+              'constraints': constraints, 'mandatory_constraints': list(mandatory), 'rubric': rubric, 'judged': judged}
+    if complete:
+        scored = [score_row(row, rubric, constraints) for row in judged]
+        report.update(scored=scored, decision=decide(scored, rubric),
+                      shadow=shadow_gate(judged, scored, rubric, constraints, mandatory))
+    return report
 
 
 def rescore(report, rubric, mandatory=None):
     """New weights or thresholds over the SAME raw answers. No judge call. The new
     rubric must ask exactly the same questions, or the stored answers would not apply:
     reworded levels or instructions need a new judge run."""
-    if not isinstance(report, dict) or report.get('schema_version', 1) > SCHEMA_VERSION:
+    version = report.get('schema_version', 1) if isinstance(report, dict) else None
+    if type(version) is not int or version > SCHEMA_VERSION or not isinstance(report.get('rubric'), dict) \
+            or not isinstance(report.get('judged'), list) \
+            or not all(isinstance(r, dict) and isinstance(r.get('label'), str) and isinstance(r.get('source'), str)
+                       for r in report['judged']):
         raise ValueError(f'this report is not one this tool can read (schema {SCHEMA_VERSION} or older)')
     if report.get('complete') is False:
         raise ValueError('this report is a checkpoint of a judge run that stopped part-way: judge again')
@@ -778,18 +825,32 @@ def append_jsonl(path, record):
 
 
 def journal_run(path, report, report_path):
-    """One line per run with both verdicts, so the gates can later be compared on the
-    decisions you label."""
-    d, s = report['decision'], report['shadow']
+    """One line per run with both verdicts and their reasons, so the gates can later be
+    compared on the decisions you label. Proposals are identified by the sha256 of their
+    text, because two files in different folders can share a name."""
+    rows = {row['label']: row for row in report['judged']}
+
+    def verdict(v):
+        return {'action': v['action'], 'source': v.get('recommended_source'), 'reasons': v['reasons'],
+                'sha256': (rows.get(v.get('recommendation')) or {}).get('proposal_sha256')}
+
     append_jsonl(path, {
         'kind': 'run', 'logged_at': now_utc(), 'tool_sha256': TOOL_SHA256, 'report': str(report_path),
         'report_sha256': sha256(Path(report_path).read_bytes()), 'brief_sha256': report['brief_sha256'],
         'rubric_sha256': sha256(json.dumps(report['rubric'], sort_keys=True).encode()),
         'models': sorted({row['model'] for row in report['judged'] if row.get('model')}),
         'mandatory_constraints': report.get('mandatory_constraints', []),
-        'operative': {'action': d['action'], 'source': d.get('recommended_source')},
-        'shadow': {'action': s['action'], 'source': s.get('recommended_source'),
-                   'p_flip': (s.get('ranking') or {}).get('p_flip')}})
+        'candidates': [row.get('proposal_sha256') for row in report['judged']],
+        'operative': verdict(report['decision']),
+        'shadow': {**verdict(report['shadow']), 'p_flip': (report['shadow'].get('ranking') or {}).get('p_flip')}})
+
+
+def picked(verdict, label):
+    """Did the gate recommend the proposal you picked? By text hash when the run has one
+    (older reports do not), otherwise by file name."""
+    if verdict.get('sha256'):
+        return verdict['sha256'] == label.get('pick_sha256')
+    return verdict.get('source') == label.get('pick')
 
 
 def wrong_rate_bound(wrong, n, confidence):
@@ -806,28 +867,51 @@ def wrong_rate_bound(wrong, n, confidence):
 
 
 def validate(records):
-    """Risk and coverage of each gate on labelled decisions: the latest run and the
-    latest label of each brief count. A recommendation is wrong when its proposal is
-    not the one you picked; an escalation is never wrong, only uncovered."""
+    """Risk and coverage of each gate on labelled decisions, one table per procedure
+    (tool, rubric, models and mandatory constraints), so a later rescore with a tuned
+    rubric adds a row instead of replacing the run you labelled. Within a procedure the
+    latest run of each brief counts, against the latest label of that brief. A
+    recommendation is wrong when its proposal is not the one you picked; an escalation
+    is never wrong, only uncovered."""
     runs, labels = {}, {}
-    for r in records:
-        if r.get('kind') == 'run':
-            runs[r['brief_sha256']] = r
-        elif r.get('kind') == 'label':
-            labels[r['brief_sha256']] = r
-    pairs = [(runs[b], labels[b]) for b in runs if b in labels]
-    lines = [f'{len(pairs)} labelled decisions ({len(runs)} run, {len(labels)} labelled)']
-    procedures = {(r['tool_sha256'], r['rubric_sha256'], tuple(r['models'])) for r, _ in pairs}
-    if len(procedures) > 1:
-        lines.append(f'warning: these runs used {len(procedures)} procedures (tool, rubric or model). Only a '
-                     'procedure frozen in advance and run on decisions it was not tuned on certifies anything.')
-    lines += ['', f"{'gate':10}{'decisions':>10}{'recommended':>13}{'wrong':>7}{'coverage':>10}   wrong at most (90% / 95%)"]
-    for gate in ('operative', 'shadow'):
-        picks = [(r[gate]['source'], label['pick']) for r, label in pairs if r[gate]['action'] == 'recommend']
-        n, k, wrong = len(pairs), len(picks), sum(source != pick for source, pick in picks)
-        coverage = f'{k / n:.0%}' if n else '-'
-        lines.append(f'{gate:10}{n:>10}{k:>13}{wrong:>7}{coverage:>10}   '
-                     f'{wrong_rate_bound(wrong, k, 0.90):.0%} / {wrong_rate_bound(wrong, k, 0.95):.0%}')
+    for i, r in enumerate(records, 1):
+        if not isinstance(r, dict) or r.get('kind') not in ('run', 'label') or 'brief_sha256' not in r \
+                or (r['kind'] == 'label' and 'pick' not in r) or (r['kind'] == 'run' and not all(
+                    k in r for k in ('tool_sha256', 'rubric_sha256', 'models', 'operative', 'shadow'))):
+            raise ValueError(f'journal line {i} is not a record this tool wrote')
+        if r['kind'] == 'run':
+            procedure = (r['tool_sha256'], r['rubric_sha256'], tuple(r['models']), tuple(r.get('mandatory_constraints', [])))
+            runs[procedure, r['brief_sha256']] = (i, r)
+        else:
+            labels[r['brief_sha256']] = (i, r)
+    groups, warnings = defaultdict(list), []
+    for (procedure, brief), (i, run) in runs.items():
+        if brief not in labels:
+            continue
+        j, label = labels[brief]
+        if label.get('pick_sha256') and any(run.get('candidates', [])) and label['pick_sha256'] not in run['candidates']:
+            warnings.append(f"warning: the label for {label['pick']} names a proposal a run did not judge; skipped")
+            continue
+        groups[procedure].append((run, label, i > j))
+    decisions = {brief for (_, brief) in runs if brief in labels}
+    lines = [f"{len(decisions)} labelled decisions ({len({b for _, b in runs})} run, {len(labels)} labelled), "
+             f"{len(groups)} procedure{'s' if len(groups) != 1 else ''}"] + warnings
+    if len(groups) > 1:
+        lines.append('Each procedure is counted on its own. Only one frozen in advance and run on decisions it was '
+                     'not tuned on certifies anything.')
+    for (tool, rubric_hash, models, mandatory), pairs in groups.items():
+        late = sum(after for _, _, after in pairs)
+        lines += ['', f"procedure: tool {tool[:8]}, rubric {rubric_hash[:8]}, models {', '.join(models) or 'n/a'}, "
+                      f"mandatory {list(mandatory) or 'none'}"]
+        if late:
+            lines.append(f'  {late} of {len(pairs)} runs were logged after their label: expected when replaying a '
+                         'frozen procedure, worthless if the procedure was tuned on these labels')
+        lines.append(f"{'gate':10}{'decisions':>10}{'recommended':>13}{'wrong':>7}{'coverage':>10}   wrong at most (90% / 95%)")
+        for gate in ('operative', 'shadow'):
+            picks = [picked(r[gate], label) for r, label, _ in pairs if r[gate]['action'] == 'recommend']
+            n, k, wrong = len(pairs), len(picks), picks.count(False)
+            lines.append(f'{gate:10}{n:>10}{k:>13}{wrong:>7}{k / n:>10.0%}   '
+                         f'{wrong_rate_bound(wrong, k, 0.90):.0%} / {wrong_rate_bound(wrong, k, 0.95):.0%}')
     lines += ['', 'Exact one-sided binomial bounds over the recommended decisions. With no wrong ones, '
               '11 support "at most 20% wrong" at 90% and 29 support "at most 10%" at 95%.']
     return '\n'.join(lines)
@@ -892,11 +976,17 @@ def read_proposals(paths):
 
 
 def write_json(path, data):
-    """Through a temp file and os.replace, so a crash never leaves half a report."""
+    """Through a temp file of its own and os.replace, so a crash never leaves half a
+    report and two runs writing the same path never share a temp file."""
     path = Path(path)
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(json.dumps(data, indent=2, allow_nan=False), encoding='utf-8')
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f'.{path.name}.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(data, indent=2, allow_nan=False))
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def parse_args(argv):
@@ -959,8 +1049,11 @@ def run(parser, args, out):
         return 0
     if args.command == 'label':
         brief = Path(args.brief).read_text(encoding='utf-8').strip()
+        none = args.pick == 'none'
+        text = None if none else Path(args.pick).read_text(encoding='utf-8').strip()
         append_jsonl(args.journal, {'kind': 'label', 'logged_at': now_utc(), 'brief_sha256': sha256(brief.encode()),
-                                    'pick': Path(args.pick).name, 'note': args.note})
+                                    'pick': 'none' if none else Path(args.pick).name,
+                                    'pick_sha256': None if none else sha256(text.encode()), 'note': args.note})
         return 0
     rubric = load_rubric(args.rubric)
     if getattr(args, 'allow_missing_confidence', False):
@@ -1003,20 +1096,20 @@ def run(parser, args, out):
         return build_report(brief, rows, rubric, judge.name, args.seed, judge.info, mandatory, complete)
 
     checkpoint = (lambda rows: write_json(args.out, report_of(rows, complete=False))) if args.out else None
-    judged = judge_all(brief, anonymised, rubric, judge, checkpoint)
-    code = finish(report_of(judged), args, out)
-    if all(row.get('error') for row in judged):
-        print('error: the judge answered none of the proposals', file=sys.stderr)
-        return 2
-    return code
+    if checkpoint:
+        checkpoint([])  # replaces any older report at --out, so a run that stops at once never leaves it looking current
+    return finish(report_of(judge_all(brief, anonymised, rubric, judge, checkpoint)), args, out)
 
 
 def finish(report, args, out):
+    print(render(report), file=out)  # first, so a failing --out or journal path never hides a paid verdict
     if args.out:
         write_json(args.out, report)
     if args.journal:
         journal_run(args.journal, report, args.out)
-    print(render(report), file=out)
+    if all(s.get('error') for s in report['scored']):
+        print('error: no proposal could be judged', file=sys.stderr)
+        return 2
     return 0 if report['decision']['action'] == 'recommend' else 1
 
 

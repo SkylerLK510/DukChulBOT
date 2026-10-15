@@ -41,7 +41,7 @@ A glob over a folder may include the brief itself. It is left out of the proposa
 
 Exit code 0 means *recommend*, 1 means *escalate* (for `judge` and `rescore` alike), and 2 means the council could not run: an input it cannot read (a missing file, bad JSON, a rubric it rejects, a rescore whose questions changed), a judge that cannot start, a judge that answered none of the proposals, or a refused API key.
 
-With `--out`, `judge` rewrites the report after every proposal (through a temp file, so a crash never leaves half a file). A run that stopped part-way leaves a report marked `"complete": false`, which `rescore` refuses; judge again.
+With `--out`, `judge` saves the raw answers after every proposal, through a temp file of its own, so a crash never leaves half a file. A run that stopped part-way leaves a checkpoint marked `"complete": false` that holds the answers and their provenance but no scores. `rescore` refuses it; judge again.
 
 ## Writing a brief
 
@@ -56,23 +56,49 @@ State the decision, the context, and the hard constraints as a bullet list under
 
 Every answer is checked before it counts: a Score outside its levels, a missing or malformed probability distribution, a bool where a number belongs, or a NaN or infinite value makes that proposal an error rather than being clamped or skipped. A NaN veto used to let its proposal through, because NaN >= 0.7 is false.
 
-Transient failures are retried the way TypeSafe's own Python SDK does: HTTP 408, 429 and 5xx, connection errors and timeouts, at most 3 attempts, backoff from 0.5 s to 5 s with jitter, and a numeric `Retry-After` honoured. One 60 s deadline covers every attempt, wait and read for a proposal. A refused key (401 or 403) stops the run instead of sending every remaining proposal, and an error's body (a 422 names the offending field) is kept in the message with the key scrubbed.
+Transient failures are retried the way TypeSafe's own Python SDK does:
+- HTTP 408, 429 and 5xx, connection errors and timeouts are retried, at most 3 attempts.
+- Backoff runs from 0.5 s to 5 s with jitter.
+- A numeric `retry-after-ms` or `Retry-After` is honoured.
+
+A 60 s deadline per proposal is checked before every attempt and every wait. The SDK's default budget is 30 s. A wait that would pass the deadline ends the proposal with an error instead of sleeping. urllib times each blocking operation, not a whole call, so each operation gets at most the time left when its attempt starts. A server that stalls mid-response can still overrun the deadline, by up to about one timeout per blocking operation.
+
+A refused key (401 or 403) stops the run instead of sending every remaining proposal. An error's body is kept in the message, since a 422 names the offending field there. The key is scrubbed from it.
 
 ## The shadow gate
 
 The confidence gate above answers one question with the leader's single least certain answer. The October 2026 research (`design-council-research/RESEARCH.md` §3.1, outside this repo) found that it mixes two questions. On the saved live run it escalates on an answer that can move the leader's total by 0.019 against a 0.168 lead. The proposed replacement asks three questions:
 
-- **Ranking: is the leader really ahead?** The margin, and the exact probability that the order flips under the judge's own distributions (Score levels and constraint answers as independent outcomes, vetoes held fixed, a tie counted as a flip). It also prints a stress case in which each proposal's answers move together, and the expected loss of committing to the leader now. A judge without distributions gets "unavailable", never a made-up number.
+- **Ranking: is the leader really ahead?** It reports the margin, and the exact probability that the order flips under the judge's own distributions:
+  - Score levels and constraint answers are treated as independent outcomes.
+  - Vetoes are held fixed.
+  - A tie counts as a flip. Weights are read as exact fractions, so totals that are equal on paper tie.
+
+  It also prints a stress case in which each proposal's answers move together, and the expected loss of committing to the leader now. Ranking uncertainty is reported as "unavailable", never as a made-up number, in two cases:
+  - a judge that reports no uncertainty, such as the Ollama judge, whose probabilities are picks;
+  - a rubric with more than 50,000 possible totals per proposal.
 - **Eligibility: could a veto change the pick?** It flags a leader whose veto answer is within `veto_band` of its threshold, and a vetoed proposal that would win if answers within the band went the other way.
-- **Acceptability: is the leader fit to adopt?** It checks the floor `min_total` and every constraint you mark with `--mandatory`. A mandatory constraint needs a confident yes, `p >= (1 + min_confidence) / 2`.
+- **Acceptability: is the leader fit to adopt?** It checks the floor `min_total` and every constraint you mark with `--mandatory`. A mandatory constraint needs a confident yes, `p >= (1 + min_confidence) / 2`, from a judge that reports confidence.
 
 It is **reported, not operative**. Every report prints what the shadow gate would do under the verdict, and the journal records both. Switch only when `validate` shows, on decisions labelled after the procedure was frozen, that it escalates less without more wrong recommendations. `max_flip` (0.10) and `veto_band` (0.06) are placeholders: the band is the largest repeat-run movement seen, not a bound. On the live run the shadow gate would recommend Proposal A at P(flip) 0.070, or 0.266 in the stress case; with `--mandatory 6` it escalates on the checkpoint-storage constraint, which is the adoption question the old gate was pointing at.
 
 ## Decision journal and validation
 
-`--journal FILE` (with `--out`) appends one line per run: the report's hash, the brief's hash, the rubric and tool hashes, the models that answered, and both verdicts. `label` appends the proposal you would pick *given what was known at the time*, which keeps hindsight out of the record. `validate` takes the latest run and label of each brief and prints, for each gate, how many decisions it recommended, how many of those you would not have picked, and an exact binomial upper bound on its wrong-recommendation rate. Escalations count as uncovered, never as wrong. With no wrong ones, 11 recommended decisions support "at most 20% wrong" at 90% confidence, and 29 support "at most 10%" at 95%. That holds only for a procedure fixed in advance and run on decisions it was not tuned on, and `validate` warns when the runs it compares used different tools, rubrics or models. The journal holds hashes and file names, not proposal text. `*.jsonl` is git-ignored.
+`--journal FILE` (with `--out`) appends one line per run. It records:
+- the hashes of the report, the brief, the rubric and the tool;
+- the models that answered and the mandatory constraints;
+- the sha256 of every proposal's text;
+- both verdicts with their reasons.
 
-Reports carry provenance (schema 3): when they were made, the sha256 of `council.py`, the Python version, the judge's URL and requested model, and per proposal its path, the sha256 of its text and of the request sent, the time taken and the attempts.
+`label` appends the proposal you would pick *given what was known at the time*, which keeps hindsight out of the record. Proposals are matched by the sha256 of their text, so two files named `option.md` in different folders are never confused. Older reports without text hashes are matched by file name. To revise a label, label again: the latest one counts, and `--note` can say why. `validate` takes the latest run and label of each brief and prints, for each gate, how many decisions it recommended, how many of those you would not have picked, and an exact binomial upper bound on its wrong-recommendation rate. Escalations count as uncovered, never as wrong. With no wrong ones, 11 recommended decisions support "at most 20% wrong" at 90% confidence, and 29 support "at most 10%" at 95%. That holds only for a procedure fixed in advance and run on decisions it was not tuned on. `validate` warns when the runs it compares used different tools, rubrics, models or mandatory constraints. Not built yet: per-dimension agreement (Krippendorff's α), which needs question-level labels that don't exist so far. The journal holds hashes and file names, not proposal text. `*.jsonl` is git-ignored.
+
+Reports carry provenance (schema 3):
+- when they were made, the sha256 of `council.py` and the Python version;
+- the judge's URL and requested model;
+- per proposal, its path, the sha256 of its text and the time taken;
+- for answered proposals, also the sha256 of the request sent and the number of attempts.
+
+Not built: `judge --reuse` to skip re-asking unchanged proposals. A rerun costs about $0.0001 per proposal, so it isn't worth the code yet.
 
 How the council is run with other seats (Claude, Codex) is in [PROTOCOL.md](PROTOCOL.md).
 

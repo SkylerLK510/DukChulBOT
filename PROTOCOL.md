@@ -16,7 +16,7 @@ How a design decision goes through the council when several seats take part (for
 5. **Probes settle disputes.** Run the probes. A seat changes position only by citing a probe result or a source. Log every change in `decisions.md` as either *resolved by evidence* or *converged without evidence*. Keep dissent that no evidence resolved visible, never averaged away.
 6. **The judge stays blind.** Give `council.py judge` the proposals, never the critique transcripts or the positions. Use `--out` and `--journal`, so both gates' verdicts are recorded.
 7. **Read the verdict, then decide.** The operative verdict decides whether the council recommends or escalates. The shadow-gate line is information for later. You make the decision; a recommendation is advice.
-8. **Label it.** Once you have decided, run `council.py label --pick <file>` with the proposal you would pick *given what was known then*. Record it when you decide, not after the outcome is known.
+8. **Label it.** Once you have decided, run `council.py label --journal <journal> --brief <brief> --pick <file>` with the proposal you would pick *given what was known then*, or `--pick none`. Record it when you decide, not after the outcome is known.
 
 ## What not to count
 

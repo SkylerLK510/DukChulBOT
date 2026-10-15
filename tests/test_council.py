@@ -168,7 +168,10 @@ class RubricTests(unittest.TestCase):
                        lambda r: r['decision'].update(min_margin=-0.1),
                        lambda r: r['decision'].update(max_flip=2),
                        lambda r: r['decision'].update(allow_missing_confidence='yes'),
-                       lambda r: r.update(dimensions={'not': 'a list'})):
+                       lambda r: r.update(dimensions={'not': 'a list'}),
+                       lambda r: r['dimensions'][1].update(id=['a', 'list']),
+                       lambda r: r['dimensions'][0].update(per_constraint=['a list']),
+                       lambda r: [d.update(weight=1e308) for d in r['dimensions']]):
             broken = json.loads(json.dumps(good)); mutate(broken)
             with mock.patch.object(Path, 'read_text', return_value=json.dumps(broken)):
                 with self.assertRaises(ValueError, msg=json.dumps(broken)[:80]):
@@ -220,6 +223,12 @@ class PerConstraintTests(unittest.TestCase):
             'Hard constraints:\n- a\n  ```\n  - not a constraint\n  ```\n- b\n': ['a', 'b'],
             # an unindented fence ends the list, like a heading
             'Hard constraints:\n- a\n```\n- code\n```\n- c\n': ['a'],
+            # a closing fence must be at least as long as the opening one
+            'Example:\n````\n```\nHard constraints:\n- fake\n````\n': [],
+            # three backticks with more backticks after them are inline code, not a fence
+            'Hard constraints:\n- a\n```sample```\n- b\n': ['a ```sample```', 'b'],
+            # an unclosed fence inside a bullet ends with the bullet
+            'Hard constraints:\n- a\n  ```\n  example\n- b\n': ['a', 'b'],
             # U+2028 is not a Markdown line ending, so the text after it is not a heading
             'Hard constraints:\n- Use the path\u2028# not a heading\n- b\n': ['Use the path # not a heading', 'b'],
         }
@@ -377,10 +386,15 @@ class TypeSafeJudgeTests(unittest.TestCase):
 
     def test_retries_what_the_typesafe_sdk_retries_with_its_backoff(self):
         clock = FakeClock()
-        replies = [http_error(429), http_error(529), http_error(503), Response(self.OK)]
-        result = self.judge(replies, clock=clock, max_attempts=4).judge('b', 'p', rubric())
-        self.assertEqual(clock.naps, [0.5, 1.0, 2.0])
-        self.assertEqual(result['attempts'], 4)
+        replies = [http_error(429), http_error(408), http_error(503), http_error(529), Response(self.OK)]
+        result = self.judge(replies, clock=clock, max_attempts=5).judge('b', 'p', rubric())
+        self.assertEqual(clock.naps, [0.5, 1.0, 2.0, 4.0])
+        self.assertEqual(result['attempts'], 5)
+        for code in (400, 404, 409):
+            calls = []
+            with self.assertRaises(c.JudgeError):
+                self.judge([http_error(code)], calls).judge('b', 'p', rubric())
+            self.assertEqual(len(calls), 1, code)
         self.assertEqual(c.retry_delay_s(None, 9, rand=lambda: 0.0), 5.0)    # capped
         self.assertEqual(c.retry_delay_s(None, 1, rand=lambda: 1.0), 0.375)  # a quarter taken off at most
 
@@ -396,6 +410,25 @@ class TypeSafeJudgeTests(unittest.TestCase):
                    http_error(529, {'Retry-After': 'Wed, 23 Sep 2026 10:00:00 GMT'}), Response(self.OK)]
         self.judge(replies, clock=clock).judge('b', 'p', rubric())
         self.assertEqual(clock.naps, [7.0, 1.0])
+
+    def test_a_wait_that_would_end_exactly_at_the_deadline_is_not_taken(self):
+        with self.assertRaisesRegex(c.JudgeError, 'would pass the 1.5 s deadline'):
+            self.judge([http_error(429), http_error(429), Response(self.OK)], deadline_s=1.5).judge('b', 'p', rubric())
+
+    def test_a_body_over_the_size_bound_is_refused(self):
+        with mock.patch.object(c, 'MAX_BODY', 10), self.assertRaisesRegex(c.JudgeError, 'larger than'):
+            self.judge([Response(self.OK)]).judge('b', 'p', rubric())
+
+    def test_honours_retry_after_ms_like_the_sdk(self):
+        self.assertEqual(c.retry_delay_s({'retry-after-ms': '7000'}, 1), 7.0)
+        self.assertEqual(c.retry_delay_s({'retry-after-ms': 'soon', 'Retry-After': '3'}, 1), 3.0)
+
+    def test_the_key_is_scrubbed_even_where_the_excerpt_would_cut_it(self):
+        for filler in (0, 290, 295, 299, 2000):
+            body = b'x' * filler + b' sk-SECRET-KEY trailing'
+            with self.assertRaises(c.JudgeError) as caught:
+                self.judge([http_error(422, body=body)], api_key='sk-SECRET-KEY').judge('b', 'p', rubric())
+            self.assertNotIn('sk-S', str(caught.exception), filler)
 
     def test_one_deadline_covers_attempts_waits_and_reads(self):
         calls = []
@@ -419,18 +452,20 @@ class TypeSafeJudgeTests(unittest.TestCase):
         self.assertLessEqual(clock.now, 60)
 
     def test_401_stops_the_run_422_fails_with_its_detail_and_neither_leaks_the_key(self):
+        for code in (401, 403):
+            calls = []
+            with self.assertRaises(c.JudgeError) as caught:
+                self.judge([http_error(code, body=b'bad key sk-SECRET')], calls, api_key='sk-SECRET').judge('b', 'p', rubric())
+            self.assertTrue(caught.exception.fatal)
+            self.assertEqual(len(calls), 1)
+            self.assertIn(str(code), str(caught.exception))
+            self.assertNotIn('SECRET', str(caught.exception))
         calls = []
-        with self.assertRaises(c.JudgeError) as caught:
-            self.judge([http_error(401, body=b'bad key sk-SECRET')], calls, api_key='sk-SECRET').judge('b', 'p', rubric())
-        self.assertTrue(caught.exception.fatal)
-        self.assertEqual(len(calls), 1)
-        self.assertIn('401', str(caught.exception))
-        self.assertNotIn('SECRET', str(caught.exception))
         body = b'{"detail": "questions.simplicity.criteria: expected an array"}'
         with self.assertRaises(c.JudgeError) as caught:
             self.judge([http_error(422, body=body)], calls, api_key='sk-SECRET').judge('b', 'p', rubric())
         self.assertFalse(caught.exception.fatal)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertIn('HTTP 422: {"detail": "questions.simplicity.criteria: expected an array"}', str(caught.exception))
 
     def test_gives_up_after_max_attempts_and_needs_at_least_one(self):
@@ -445,9 +480,13 @@ class TypeSafeJudgeTests(unittest.TestCase):
     def test_unreachable_garbage_and_missing_key(self):
         with self.assertRaisesRegex(c.JudgeError, 'unreachable'):
             self.judge([urllib.error.URLError('nope')] * 3).judge('b', 'p', rubric())
-        for body in (b'<html>', b'\xff\xfe not utf-8', b'{"answers": {"x": {"noul": NaN}}}'):
+        for body in (b'<html>', b'\xff\xfe not utf-8', b'{"answers": {"x": {"noul": NaN}}}', b'{"x": 1e400}'):
+            calls = []
             with self.assertRaisesRegex(c.JudgeError, 'not valid JSON'):
-                self.judge([Response(body)]).judge('b', 'p', rubric())
+                self.judge([Response(body) for _ in range(3)], calls).judge('b', 'p', rubric())
+            self.assertEqual(len(calls), 3)              # a garbled body may be one cut short, so it is retried
+        result = self.judge([Response(b'{"answers": {"x"'), Response(self.OK)]).judge('b', 'p', rubric())
+        self.assertEqual(result['attempts'], 2)
         for body in (b'{"oops":1}', b'[]', b'null'):
             with self.assertRaisesRegex(c.JudgeError, 'no answers'):
                 self.judge([Response(body)]).judge('b', 'p', rubric())
@@ -574,6 +613,34 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(d['action'], 'recommend')
         self.assertTrue(any('allow_missing_confidence' in r for r in d['reasons']))
 
+    def test_the_opt_out_waives_only_missing_confidence_never_a_known_low_one(self):
+        rub = rubric()
+        rub['decision']['allow_missing_confidence'] = True
+        top = {d['id']: 3 for d in rub['dimensions'] if 'levels' in d}
+        lead = answers(top, addressed={'constraint_fit.1': 0.5, 'constraint_fit.2': 1.0})
+        lead['constraint_fit.2']['confidence'] = None
+        row = {'label': 'Proposal A', 'source': 'a.md', 'answers': lead}
+        scored = c.score_row(row, rub, c.parse_constraints(BRIEF))
+        self.assertEqual((scored['dimensions']['constraint_fit']['confidence'], scored['no_confidence']), (0.0, ['constraint_fit']))
+        d = c.decide([scored], rub)
+        self.assertEqual(d['action'], 'escalate')
+        self.assertTrue(any('below min_confidence' in r for r in d['reasons']), d['reasons'])
+
+    def test_answers_that_all_fail_validation_exit_2(self):
+        class Empty:
+            name, info = 'fake', {}
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def judge(self, *a):
+                return {'answers': {}, 'model': 'fake', 'usage': None}
+
+        err = io.StringIO()
+        with mock.patch.object(c, 'TypeSafeJudge', Empty), mock.patch.object(c.sys, 'stderr', err):
+            self.assertEqual(c.main(['judge', *CliTests.ARGS], out=io.StringIO()), 2)
+        self.assertIn('no proposal could be judged', err.getvalue())
+
     def test_a_sole_survivor_must_clear_the_floor(self):
         d = self.run_council({'weak': flat(0), 'vetoed': flat(3, vetoes={'violates_hard_constraint': 0.95})})['decision']
         self.assertEqual((d['action'], d['recommended_source']), ('escalate', 'weak.md'))
@@ -617,6 +684,64 @@ class ShadowGateTests(unittest.TestCase):
         self.assertEqual(report['shadow']['action'], 'recommend')
         tied = self.run_council({'a': flat(2), 'b': flat(2)})['shadow']['ranking']
         self.assertEqual(tied['p_flip'], 1.0)
+
+    def test_different_answers_with_the_same_total_tie_exactly(self):
+        rub = score_rubric()
+        rub['dimensions'] = [{'id': f'd{i}', 'weight': 1, 'instructions': '`proposal`?', 'levels': ['0', '1', '2']}
+                             for i in range(3)]
+        rub['vetoes'] = []
+        a = {'d0': score_answer(1, 2), 'd1': score_answer(1, 2), 'd2': score_answer(0, 2)}
+        b = {'d0': score_answer(2, 2), 'd1': score_answer(0, 2), 'd2': score_answer(0, 2)}
+        ranking = self.run_council({'a': a, 'b': b}, rub)['shadow']['ranking']
+        self.assertEqual((ranking['p_flip'], ranking['p_flip_together']), (1.0, 1.0))
+
+    def test_a_rubric_too_fine_to_enumerate_is_unavailable_not_slow(self):
+        rub = score_rubric()
+        rub['dimensions'] = [{'id': f'd{i}', 'weight': 1 / (i + 3), 'instructions': '`proposal`?',
+                              'levels': [str(k) for k in range(6)]} for i in range(10)]
+        rub['vetoes'] = []
+        even = {'type': 'score', 'score': 2.5, 'confidence': 0.2, 'probabilities': {str(k): 1 / 6 for k in range(6)}}
+        by_text = {name: {f'd{i}': dict(even) for i in range(10)} for name in ('a', 'b')}
+        by_text['b']['d0'] = score_answer(0, 5)
+        started = c.time.monotonic()
+        report = self.run_council(by_text, rub)
+        self.assertLess(c.time.monotonic() - started, 20)
+        self.assertIn('more than', report['shadow']['ranking']['unavailable'])
+
+    def test_a_mandatory_check_needs_a_reported_confidence(self):
+        rub = rubric()
+        sure = answers({d['id']: 3 for d in rub['dimensions'] if 'levels' in d}, confidence=None,
+                       addressed={'constraint_fit.1': 1.0, 'constraint_fit.2': 1.0})
+        for qid in ('constraint_fit.1', 'constraint_fit.2'):
+            sure[qid]['confidence'] = None
+        row = {'label': 'Proposal A', 'source': 'a.md', 'answers': sure}
+        constraints = c.parse_constraints(BRIEF)
+        shadow = c.shadow_gate([row], [c.score_row(row, rub, constraints)], rub, constraints, [1])
+        self.assertEqual(shadow['action'], 'escalate')
+        self.assertIn('mandatory constraint 1 cannot be checked', shadow['reasons'][0])
+
+    def test_real_distributions_without_a_confidence_summary_still_count(self):
+        report = json.loads(self.LIVE.read_text(encoding='utf-8'))
+        for row in report['judged']:
+            for answer in row['answers'].values():
+                answer.pop('confidence', None)
+        ranking = c.rescore(report, rubric())['shadow']['ranking']
+        self.assertAlmostEqual(ranking['p_flip'], 0.069923845, places=8)
+
+    def test_a_flip_probability_above_max_flip_escalates_the_shadow_gate(self):
+        r = rubric()
+        r['decision']['max_flip'] = 0.05
+        shadow = c.rescore(json.loads(self.LIVE.read_text(encoding='utf-8')), r)['shadow']
+        self.assertEqual(shadow['action'], 'escalate')
+        self.assertIn('above max_flip 0.05', shadow['reasons'][0])
+
+    def test_the_veto_band_edge_and_a_vetoed_low_scorer(self):
+        on_edge = self.run_council({'lead': flat(3, vetoes={'violates_hard_constraint': 0.64}), 'trail': flat(1)})
+        self.assertTrue(any('would remove the leader' in r for r in on_edge['shadow']['reasons']))
+        outside = self.run_council({'lead': flat(3, vetoes={'violates_hard_constraint': 0.63}), 'trail': flat(1)})
+        self.assertEqual(outside['shadow']['action'], 'recommend')
+        low = self.run_council({'weak': flat(1, vetoes={'violates_hard_constraint': 0.72}), 'sound': flat(3)})
+        self.assertEqual(low['shadow']['action'], 'recommend')    # un-vetoing it would not change the pick
 
     def test_a_vetoed_high_scorer_or_a_leader_near_the_threshold_is_flagged(self):
         report = self.run_council({'flashy': flat(3, vetoes={'violates_hard_constraint': 0.72}), 'sound': flat(2)})
@@ -673,9 +798,72 @@ class CheckpointAndJournalTests(unittest.TestCase):
         self.assertIn('HTTP 401', err.getvalue())
         saved = json.loads(out.read_text())
         self.assertEqual((saved['complete'], len(saved['judged'])), (False, 1))
-        self.assertFalse(list(self.dir.glob('*.tmp')))
+        self.assertEqual([f.name for f in self.dir.iterdir()], ['run.json'])  # no temp file left behind
+        self.assertNotIn('scored', saved)                                       # a checkpoint holds raw answers only
         with self.assertRaisesRegex(ValueError, 'stopped part-way'):
             c.rescore(saved, rubric())
+
+    def fake_judge(self, by_text):
+        class Fake:
+            name, info = 'fake', {}
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def judge(self, b, proposal, rub):
+                return {'answers': by_text(proposal), 'model': 'fake', 'usage': None}
+        return Fake
+
+    def test_a_checkpoint_after_every_proposal_and_the_flags_reach_the_report(self):
+        writes, real = [], c.write_json
+
+        def spy(path, data):
+            writes.append((len(data['judged']), data['complete']))
+            real(path, data)
+
+        out = self.dir / 'run.json'
+        unsure = answers({d['id']: 3 for d in rubric()['dimensions'] if 'levels' in d}, confidence=None,
+                         addressed={f'constraint_fit.{i}': 0.9 for i in range(1, 8)})
+        for qid in unsure:
+            unsure[qid]['confidence'] = None
+        fake = self.fake_judge(lambda proposal: unsure)
+        with mock.patch.object(c, 'TypeSafeJudge', fake), mock.patch.object(c, 'write_json', spy), \
+                mock.patch.object(c.sys, 'stderr', io.StringIO()):
+            self.assertEqual(c.main(['judge', *CliTests.ARGS, '--out', str(out), '--mandatory', '2'], out=io.StringIO()), 1)
+            self.assertEqual(writes, [(0, False), (1, False), (2, False), (3, False), (3, True)])
+            self.assertEqual(c.main(['judge', *CliTests.ARGS, '--allow-missing-confidence'], out=io.StringIO()), 1)
+        saved = json.loads(out.read_text())
+        self.assertEqual(saved['mandatory_constraints'], [2])
+        self.assertTrue(any('mandatory constraint 2 cannot be checked' in r for r in saved['shadow']['reasons']))
+        self.assertTrue(any('no confidence' in r for r in saved['decision']['reasons']))
+
+    def test_allow_missing_confidence_reaches_the_gate_from_the_command_line(self):
+        rub = score_rubric()
+        items = c.anonymise([('lead.md', 'lead'), ('trail.md', 'trail')])
+        judged = c.judge_all('brief', items, rub, ScriptedJudge({'lead': flat(3, confidence=None), 'trail': flat(1, confidence=None)}))
+        report = self.dir / 'r.json'
+        rub_path = self.dir / 'rubric.json'
+        rub_path.write_text(json.dumps(rub))
+        report.write_text(json.dumps(c.build_report('brief', judged, rub, 'scripted', 0)))
+        args = ['rescore', '--report', str(report), '--rubric', str(rub_path)]
+        self.assertEqual(c.main(args, out=io.StringIO()), 1)
+        self.assertEqual(c.main(args + ['--allow-missing-confidence'], out=io.StringIO()), 0)
+
+    def test_a_failed_write_leaves_the_old_report_whole(self):
+        out = self.dir / 'run.json'
+        c.write_json(out, {'old': True})
+        with mock.patch.object(c.os, 'replace', side_effect=OSError('disk full')), self.assertRaises(OSError):
+            c.write_json(out, {'new': True})
+        self.assertEqual(json.loads(out.read_text()), {'old': True})
+        self.assertEqual([f.name for f in self.dir.iterdir()], ['run.json'])
+
+    def test_the_verdict_prints_even_if_the_journal_cannot_be_written(self):
+        out, err = io.StringIO(), io.StringIO()
+        args = ['rescore', '--report', str(EXAMPLE / 'live-run.jev-1.13.0.json'), '--rubric', str(c.DEFAULT_RUBRIC),
+                '--out', str(self.dir / 'r.json'), '--journal', str(self.dir / 'missing-dir' / 'j.jsonl')]
+        with mock.patch.object(c.sys, 'stderr', err):
+            self.assertEqual(c.main(args, out=out), 2)
+        self.assertIn('ESCALATE TO A HUMAN', out.getvalue())
 
     def test_journal_label_and_validate(self):
         report, journal = self.dir / 'r.json', self.dir / 'decisions.jsonl'
@@ -693,6 +881,75 @@ class CheckpointAndJournalTests(unittest.TestCase):
         rows = {line.split()[0]: line.split() for line in out.getvalue().splitlines() if line.startswith(('operative', 'shadow'))}
         self.assertEqual(rows['operative'][1:5], ['1', '0', '0', '0%'])
         self.assertEqual(rows['shadow'][1:5], ['1', '1', '0', '100%'])
+
+    def test_two_proposals_with_the_same_file_name_are_told_apart(self):
+        for side in ('left', 'right'):
+            (self.dir / side).mkdir()
+            (self.dir / side / 'option.md').write_text(f'the {side} option')
+        brief, journal, report = self.dir / 'brief.md', self.dir / 'j.jsonl', self.dir / 'r.json'
+        brief.write_text(BRIEF)
+        good = answers({d['id']: 3 for d in rubric()['dimensions'] if 'levels' in d},
+                       addressed={'constraint_fit.1': 0.95, 'constraint_fit.2': 0.95})
+        poor = answers({d['id']: 0 for d in rubric()['dimensions'] if 'levels' in d},
+                       addressed={'constraint_fit.1': 0.05, 'constraint_fit.2': 0.05})
+
+        class ByText:
+            name, info = 'fake', {}
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def judge(self, b, proposal, rub):
+                return {'answers': good if 'left' in proposal else poor, 'model': 'fake', 'usage': None}
+
+        with mock.patch.object(c, 'TypeSafeJudge', ByText), mock.patch.object(c.sys, 'stderr', io.StringIO()):
+            self.assertEqual(c.main(['judge', '--brief', str(brief), '--proposals', str(self.dir / 'left' / 'option.md'),
+                                     str(self.dir / 'right' / 'option.md'), '--out', str(report),
+                                     '--journal', str(journal)], out=io.StringIO()), 0)
+        c.main(['label', '--journal', str(journal), '--brief', str(brief), '--pick', str(self.dir / 'right' / 'option.md')])
+        out = io.StringIO()
+        c.main(['validate', '--journal', str(journal)], out=out)
+        rows = {line.split()[0]: line.split() for line in out.getvalue().splitlines() if line.startswith(('operative', 'shadow'))}
+        self.assertEqual(rows['operative'][1:4], ['1', '1', '1'])    # recommended left, you picked right: wrong
+        labels = [json.loads(line) for line in journal.read_text().splitlines()]
+        labels[-1]['pick_sha256'] = c.sha256(b'a file the run never judged')
+        self.assertIn('did not judge', c.validate(labels))
+
+    def test_validate_warns_when_mandatory_checks_differ(self):
+        base = {'tool_sha256': 't', 'rubric_sha256': 'r', 'models': ['m'], 'candidates': [],
+                'operative': {'action': 'escalate'}, 'shadow': {'action': 'escalate'}}
+        records = [{**base, 'kind': 'run', 'brief_sha256': 'b1', 'mandatory_constraints': []},
+                   {**base, 'kind': 'run', 'brief_sha256': 'b2', 'mandatory_constraints': [1]},
+                   {'kind': 'label', 'brief_sha256': 'b1', 'pick': 'x.md', 'pick_sha256': None},
+                   {'kind': 'label', 'brief_sha256': 'b2', 'pick': 'x.md', 'pick_sha256': None}]
+        self.assertIn('2 procedures', c.validate(records))
+
+    def test_malformed_reports_are_refused_cleanly(self):
+        for bad in ({'schema_version': '3', 'rubric': {}, 'judged': []}, {'schema_version': 2, 'judged': []},
+                    {'schema_version': 4, 'rubric': {}, 'judged': []},
+                    {'schema_version': 2, 'rubric': {}, 'judged': ['x']}, []):
+            with self.assertRaisesRegex(ValueError, 'not one this tool can read'):
+                c.rescore(bad, rubric())
+
+    def test_a_rescore_after_the_label_is_counted_beside_the_labelled_run_not_over_it(self):
+        base = {'kind': 'run', 'brief_sha256': 'b', 'tool_sha256': 't', 'models': ['m'], 'candidates': ['x', 'y'],
+                'shadow': {'action': 'escalate'}}
+        records = [{**base, 'rubric_sha256': 'r1', 'operative': {'action': 'recommend', 'sha256': 'x'}},
+                   {'kind': 'label', 'brief_sha256': 'b', 'pick': 'y.md', 'pick_sha256': 'y'},
+                   {**base, 'rubric_sha256': 'r2', 'operative': {'action': 'recommend', 'sha256': 'y'}},
+                   {'kind': 'label', 'brief_sha256': 'b', 'pick': 'y.md', 'pick_sha256': 'y', 'note': 'same pick again'}]
+        text = c.validate(records)
+        rows = [line.split() for line in text.splitlines() if line.startswith('operative')]
+        self.assertEqual([r[1:4] for r in rows], [['1', '1', '1'], ['1', '1', '0']])   # the wrong one stays on record
+        self.assertIn('2 procedures', text)
+        self.assertIn('logged after their label', c.validate(records[:3]))
+        relabelled = records[:2] + [{'kind': 'label', 'brief_sha256': 'b', 'pick': 'x.md', 'pick_sha256': 'x'}]
+        self.assertIn('operative          1            1      0', c.validate(relabelled))  # the latest label counts
+
+    def test_a_malformed_journal_is_refused_cleanly(self):
+        for bad in ([{'kind': 'run', 'brief_sha256': 'b'}], [{'kind': 'label'}], [['x']], [{'kind': 'other', 'brief_sha256': 'b'}]):
+            with self.assertRaisesRegex(ValueError, 'journal line 1'):
+                c.validate(bad)
 
     def test_journal_needs_a_saved_report(self):
         with mock.patch.object(c.sys, 'stderr', io.StringIO()), self.assertRaises(SystemExit):
