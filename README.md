@@ -153,6 +153,29 @@ filesystem dependency with this council. Run `python3 council.py` here and
 `python3 ringo.py` from the Ringo checkout. The former combined source is archived
 outside this repository for review; no historical evaluation stores were moved.
 
+## Bridge for Ringo's `work` command
+
+`bridge.py` is an offline JSON bridge for the Ringo harness's `work` command. It
+runs no models or commands: Ringo makes the judge calls and owns their budget, and
+the bridge scores the replies with this council's parser, aggregation and
+decision gate. Ringo has no import of, or hardcoded path to, this checkout; each
+Ringo task names the bridge command and rubric file explicitly.
+
+A request is one JSON object on stdin, and the bridge prints one JSON object.
+`prepare` takes `brief`, `proposal`, `rubric` (a path) and `samples` (2 to 25), and
+returns the judge prompts with a `fingerprint` and a `policy_sha256`. `score` takes
+the same fields plus that `fingerprint`, one text reply per sample and a `model`
+label, and returns the complete council report. The fingerprint covers the prompts
+and the policy: rubric content, `council.py`, `bridge.py` and the judge skill. A
+reply set for a different fingerprint is refused. The brief needs a
+`Hard constraints:` list, and every constraint is mandatory in the decision. A
+rejected request or an unreadable reply exits with code 2 and a message on stderr.
+
+`rubrics/artifact_design.json` and `rubrics/code_change.json` are starting rubrics
+for implemented artifacts and code changes. They score the supplied files and
+check results, and are not calibrated against real outcomes yet.
+`tests/test_bridge.py` covers the bridge offline.
+
 ## How a decision is made
 
 1. Proposals are shuffled and relabelled `Proposal A, B, ...`. The judge sees only the brief and the proposal text. The label-to-file map stays in the report.
