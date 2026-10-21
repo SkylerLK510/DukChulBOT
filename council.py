@@ -1,4 +1,4 @@
-"""Design council: several proposals in, one ADVISORY recommendation out.
+"""Ringo design council: several proposals in, one ADVISORY recommendation out.
 
 After Karpathy's llm-council, with one change of shape. There, LLMs answer, LLMs
 rank each other in prose, and a chairman LLM writes the verdict. Here:
@@ -10,7 +10,7 @@ rank each other in prose, and a chairman LLM writes the verdict. Here:
   3. CODE is the chairman: weights, veto thresholds and a confidence gate decide
      between "recommend X" and "escalate to a human", and say why
 
-The default judge is DukChulBOT: an LLM acting as Jev through its own CLI (claude, codex, or any
+The default judge is Ringo: an LLM acting as Jev through its own CLI (claude, codex, or any
 command that reads a prompt on stdin), asked several times per proposal so that
 disagreement between runs gives the probabilities. TypeSafe's paid System One API
 (https://docs.typesafe.ai/api) and a local Ollama model are the other judges. Raw answers
@@ -51,7 +51,7 @@ SCHEMA_VERSION = 3  # 3: provenance, checkpoints, mandatory constraints, the sha
 TYPESAFE_URL = 'https://api.typesafe.ai/v1/systemone'
 DEFAULT_MODEL = 'jev-latest'
 DEFAULT_RUBRIC = Path(__file__).parent / 'rubrics' / 'system_design.json'
-SKILL = Path(__file__).parent / 'skills' / 'dukchulbot' / 'SKILL.md'  # DukChulBOT's instructions
+SKILL = Path(__file__).parent / 'skills' / 'ringo' / 'SKILL.md'  # Ringo's instructions
 # Commands checked to give the plain model with no user settings (the Claude CLI would otherwise
 # load the user's default agent), skills, MCP servers, plugins, web search or saved session. Codex
 # keeps its built-in shell tools, sandboxed read-only in an empty folder.
@@ -452,7 +452,7 @@ class OllamaJudge:
 
 
 def skill_prompt():
-    """DukChulBOT's instructions: skills/dukchulbot/SKILL.md without its front matter."""
+    """Ringo's instructions: skills/ringo/SKILL.md without its front matter."""
     text = SKILL.read_text(encoding='utf-8')
     if text.startswith('---\n'):
         text = text.split('\n---\n', 1)[1]
@@ -602,11 +602,11 @@ class CommandJudge:
     better than a confidence the model states (Jung et al., ICLR 2025: AUROC 0.72 against 0.55),
     but it is not calibrated either. One sample has no distribution, so its answers carry
     confidence None, as the Ollama judge's do."""
-    name = 'dukchulbot'
+    name = 'ringo'
 
     def __init__(self, commands, samples=6, timeout_s=600.0, max_attempts=2, runner=None):
         if not commands:
-            raise JudgeError(f"DukChulBOT needs --judge-cmd: a preset ({', '.join(JUDGE_PRESETS)}) "
+            raise JudgeError(f"Ringo needs --judge-cmd: a preset ({', '.join(JUDGE_PRESETS)}) "
                              'or a full command that reads a prompt on stdin')
         if type(samples) is not int or not 1 <= samples <= 25 or type(max_attempts) is not int or max_attempts < 1 \
                 or not is_number(timeout_s) or timeout_s <= 0:
@@ -1259,8 +1259,8 @@ def parse_args(argv):
             p.add_argument('--seed', type=int, default=0)
             p.add_argument('--typesafe-model', default=DEFAULT_MODEL,
                            help='alias or version; pin a version such as jev-1.13.0 once thresholds are tuned')
-            p.add_argument('--judge', choices=('dukchulbot', 'typesafe', 'ollama'), default='dukchulbot',
-                           help='dukchulbot (default): DukChulBOT, an LLM through its CLI, no API bill; typesafe: the paid Jev API')
+            p.add_argument('--judge', choices=('ringo', 'dukchulbot', 'typesafe', 'ollama'), default='ringo',
+                           help='ringo (default): an LLM through its CLI; dukchulbot: legacy alias; typesafe: the paid Jev API')
         if name == 'show-request':
             continue
         if name == 'judge':
@@ -1268,7 +1268,7 @@ def parse_args(argv):
                            help=f"a preset ({', '.join(JUDGE_PRESETS)}) or a command that reads the prompt on stdin; "
                                 'repeat it for a panel, sampled in turn')
             p.add_argument('--samples', type=int, default=6,
-                           help='runs per proposal for DukChulBOT (default 6: even, so a 2-command panel splits evenly)')
+                           help='runs per proposal for Ringo (default 6: even, so a 2-command panel splits evenly)')
             p.add_argument('--ollama-url', default='http://localhost:11434')
             p.add_argument('--ollama-model', default='qwen2.5:7b')
         p.add_argument('--out', help='write the full JSON report here (judge: also after each proposal)')
@@ -1288,6 +1288,8 @@ def parse_args(argv):
     p = sub.add_parser('validate', help='risk and coverage of the operative and shadow gates on labelled decisions')
     p.add_argument('--journal', required=True)
     args = parser.parse_args(argv)
+    if getattr(args, 'judge', None) == 'dukchulbot':
+        args.judge = 'ringo'
     if getattr(args, 'journal', None) and args.command in ('judge', 'rescore') and not args.out:
         parser.error('--journal needs --out, so the journal can point at a saved report')
     return parser, args
@@ -1345,7 +1347,7 @@ def run(parser, args, out):
     if args.command == 'show-request':
         for item in anonymised:
             print(f"# {item['label']}  <- {item['source']}", file=out)
-            if args.judge == 'dukchulbot':  # the first sample's prompt; later samples reorder questions and levels
+            if args.judge == 'ringo':  # the first sample's prompt; later samples reorder questions and levels
                 print(judge_prompt(brief, item['text'], build_questions(rubric, constraints), 0)[0], file=out)
             else:
                 print(json.dumps(build_request(brief, item['text'], rubric, args.typesafe_model), indent=2), file=out)

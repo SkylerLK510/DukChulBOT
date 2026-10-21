@@ -1,7 +1,7 @@
 # Scale trap: results (2026-10-15)
 
 **Setup.**
-- **Judge.** DukChulBOT (then called the cmd judge, so the reports say `judge: cmd`), with 5 samples per proposal: `--judge-cmd claude` and `--judge-cmd codex`. The reports record only the command. In the same day's isolation checks they resolved to Claude Sonnet 5.5 and Codex gpt-6.1-sol.
+- **Judge.** Ringo (then called the cmd judge, so the reports say `judge: cmd`), with 5 samples per proposal: `--judge-cmd claude` and `--judge-cmd codex`. The reports record only the command. In the same day's isolation checks they resolved to Claude Sonnet 5.5 and Codex gpt-6.1-sol.
 - **Pre-registration.** Expectations are in [EXPECTED.md](EXPECTED.md) and [holdout/PREREG.md](holdout/PREREG.md), each written before its runs.
 - **Raw reports** are in `design-council-research/judge-oct15/`, outside this repo.
 - **Builds and aggregation.** The runs used plain sample shares and builds of `council.py` from earlier the same day. A later review rebuilt every prompt byte-identically and replayed every total and verdict from the stored picks. The judge now shrinks shares toward an even split, which rescales every score the same way and keeps these rankings.

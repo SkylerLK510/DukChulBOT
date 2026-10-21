@@ -1567,7 +1567,7 @@ class CliTests(unittest.TestCase):
                 mock.patch.object(c.sys, 'stderr', io.StringIO()):
             code = c.main(['judge', '--judge-cmd', 'fake', '--samples', '3', *self.ARGS, '--out', str(report)], out=out)
         saved = json.loads(report.read_text())
-        self.assertEqual((saved['judge'], saved['judge_config']['samples'], saved['complete']), ('dukchulbot', 3, True))
+        self.assertEqual((saved['judge'], saved['judge_config']['samples'], saved['complete']), ('ringo', 3, True))
         self.assertTrue(all(len(row['samples']) == 3 for row in saved['judged']))
         self.assertIn('samples: 3', out.getvalue().splitlines()[0])
         self.assertEqual(code, 0 if saved['decision']['action'] == 'recommend' else 1)
