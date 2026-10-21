@@ -507,15 +507,11 @@ def _object(pairs):
     return obj
 
 
-def read_reply(text, keys):
-    """{question id: level or bool} from a judge's reply. The reply must hold exactly one
-    top-level JSON object with exactly the questions' keys, bare or inside prose or a code
-    fence. An object nested in another is never read, and an object that repeats a key does not
-    count, so JSON quoted from a proposal cannot stand in for the answer: a second matching
-    object makes the reply ambiguous. Anything else raises ValueError, and a missing or non-bool
-    veto is never read as false, which would let it pass."""
+def top_level_objects(text):
+    """Every top-level JSON object in text, bare or inside prose or a code fence. An object nested in another is
+    never yielded on its own, and each object records whether it repeats a key (repeats_a_key)."""
     decoder = json.JSONDecoder(parse_constant=_no_constant, parse_float=_finite_float, object_pairs_hook=_object)
-    found, nearest, start = [], None, 0
+    start = 0
     while (start := text.find('{', start)) != -1:
         try:
             obj, end = decoder.raw_decode(text, start)
@@ -523,8 +519,19 @@ def read_reply(text, keys):
             start += 1
             continue
         start = end  # skip the object's inside: a nested object is never the answer
-        if not isinstance(obj, dict):
-            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def read_reply(text, keys):
+    """{question id: level or bool} from a judge's reply. The reply must hold exactly one
+    top-level JSON object with exactly the questions' keys, bare or inside prose or a code
+    fence. An object nested in another is never read, and an object that repeats a key does not
+    count, so JSON quoted from a proposal cannot stand in for the answer: a second matching
+    object makes the reply ambiguous. Anything else raises ValueError, and a missing or non-bool
+    veto is never read as false, which would let it pass."""
+    found, nearest = [], None
+    for obj in top_level_objects(text):
         if set(obj) == set(keys) and not obj.repeats_a_key:
             found.append(obj)
         elif nearest is None or len(set(keys) - set(obj)) < len(set(keys) - set(nearest)):
@@ -553,9 +560,41 @@ def read_reply(text, keys):
     return picks
 
 
+def run_isolated(argv, prompt, timeout_s):
+    """stdout of one run. The working folder is empty, so no project instructions or files
+    load from it; it is not a file-system boundary. The command gets the caller's
+    environment without the TypeSafe key, in a session of its own, so a timeout kills it and
+    everything it started, not only the direct child."""
+    # ceiling: stdout is read whole; a command that floods it fills disk and memory
+    env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
+    # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
+    # started still holds stdout open; whatever it started is then killed with its session.
+    with tempfile.TemporaryDirectory(prefix='council-judge-') as cwd, tempfile.TemporaryFile() as out, \
+            tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=err, cwd=cwd, env=env,
+                                start_new_session=True)
+        try:
+            proc.communicate(prompt.encode('utf-8'), timeout=timeout_s)
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL) if hasattr(os, 'killpg') else proc.kill()
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+        out.seek(0)
+        err.seek(0)
+        stdout, stderr = out.read().decode('utf-8', 'replace'), err.read().decode('utf-8', 'replace')
+    if proc.returncode:
+        tail = ' '.join(stderr.split())[-300:]
+        exc = JudgeError(f'{Path(argv[0]).name} exited with {proc.returncode}' + (f': {tail}' if tail else ''))
+        exc.stdout = stdout  # a CLI can report on stdout what the failed call cost
+        raise exc
+    return stdout
+
+
 class CommandJudge:
-    """An LLM acting as Jev through its own command-line tool, with no API bill. Each sample runs
-    one command (round robin over several) with skills/dukchulbot/SKILL.md, the questions and the input
+    """An LLM acting as Jev through its own command-line tool. Backend usage may be billed. Each sample runs
+    one command (round robin over several) with skills/ringo/SKILL.md, the questions and the input
     on stdin, in an empty folder, and reads one pick per question from the reply. Disagreement
     between samples is the uncertainty: a level's probability is the share of samples that chose
     it, a Noul's the share that said true, each shrunk by one pseudo-sample toward an even split.
@@ -582,33 +621,8 @@ class CommandJudge:
                      'max_attempts': max_attempts, 'skill_sha256': sha256(SKILL.read_bytes())}
 
     def run_command(self, argv, prompt):
-        """stdout of one run. The working folder is empty, so no project instructions or files
-        load from it; it is not a file-system boundary. The command gets the caller's
-        environment without the TypeSafe key, in a session of its own, so a timeout kills it and
-        everything it started, not only the direct child."""
-        # ceiling: stdout is read whole; a command that floods it fills disk and memory
-        env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
-        # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
-        # started still holds stdout open; whatever it started is then killed with its session.
-        with tempfile.TemporaryDirectory(prefix='council-judge-') as cwd, tempfile.TemporaryFile() as out, \
-                tempfile.TemporaryFile() as err:
-            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=err, cwd=cwd, env=env,
-                                    start_new_session=True)
-            try:
-                proc.communicate(prompt.encode('utf-8'), timeout=self.timeout_s)
-            finally:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL) if hasattr(os, 'killpg') else proc.kill()
-                except (ProcessLookupError, PermissionError):
-                    pass
-                proc.wait()
-            out.seek(0)
-            err.seek(0)
-            stdout, stderr = out.read().decode('utf-8', 'replace'), err.read().decode('utf-8', 'replace')
-        if proc.returncode:
-            tail = ' '.join(stderr.split())[-300:]
-            raise JudgeError(f'{Path(argv[0]).name} exited with {proc.returncode}' + (f': {tail}' if tail else ''))
-        return stdout
+        """stdout of one run of argv with prompt on stdin, isolated as run_isolated describes."""
+        return run_isolated(argv, prompt, self.timeout_s)
 
     def sample(self, k, prompt, keys):
         """Sample k's picks and the attempts it took. A failed or unreadable reply is asked again;
