@@ -1,0 +1,24 @@
+{
+  "name": "code_change",
+  "note": "Starting coding rubric. Passing supplied checks does not establish scientific validity, security or unseen-case correctness. Calibrate with real outcomes.",
+  "dimensions": [
+    {"id": "constraint_fit", "weight": 0.3, "per_constraint": {
+      "question": "Do the implementation files and observed checks in `proposal` meet `constraint`?",
+      "criteria": {"true": "A concrete implementation or observed check addresses the requirement.", "false": "It is absent, contradicted, or merely asserted in rationale."}}},
+    {"id": "correctness", "weight": 0.3, "instructions": "Does the actual implementation preserve the specified behavior, interfaces and failure handling, including boundary cases and applicable shape, dtype, unit and time conventions?",
+      "levels": ["Concrete core correctness defect", "Main path implemented but a concrete required boundary/failure behavior missing", "Main path and relevant boundary/failure behaviors implemented", "Behavior and edge cases supported by implementation plus concrete independent reference or invariant checks"]},
+    {"id": "maintainability", "weight": 0.2, "instructions": "Is the implementation a small complete change with clear boundaries, understandable interfaces, reuse of existing facilities and preserved validation?",
+      "levels": ["Unnecessary architecture or obscured behavior", "Workable but important duplication or unclear responsibilities", "Focused implementation and clear responsibilities", "Focused implementation with well-defined contracts and appropriate reuse, without speculative layers"]},
+    {"id": "verification", "weight": 0.2, "instructions": "What executed evidence supports the claims? Check logs describe only the supplied checks, not universal correctness.",
+      "levels": ["No executed evidence or a failing essential check", "Only a happy-path example", "Relevant acceptance and failure checks passed", "Acceptance, regression and reference/invariant checks passed, with explicit remaining limits"]}
+  ],
+  "vetoes": [
+    {"id": "breaks_requirement", "threshold": 0.7,
+      "instructions": "Does the supplied implementation concretely violate a hard constraint?",
+      "criteria": {"true": "Identify an actual contradiction, not a speculative concern.", "false": "No concrete contradiction is shown."}},
+    {"id": "invalid_evidence", "threshold": 0.7,
+      "instructions": "Does the implementation bypass checks, fabricate results, leak assessment data into fitting, or claim capabilities not implemented?",
+      "criteria": {"true": "Concrete supplied code or material demonstrates one of these behaviors.", "false": "No such behavior is demonstrated."}}
+  ],
+  "decision": {"min_confidence": 0.5, "min_total": 0.65, "min_margin": 0.05}
+}

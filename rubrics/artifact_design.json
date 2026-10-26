@@ -1,0 +1,26 @@
+{
+  "name": "artifact_design",
+  "note": "Starting rubric for implemented visual/document artifacts. Scores are advice, not measured user preference. Judge the supplied files and observed checks; rationale cannot supply missing behavior.",
+  "dimensions": [
+    {"id": "constraint_fit", "weight": 0.3, "per_constraint": {
+      "question": "Does the actual artifact in `proposal` address `constraint`?",
+      "criteria": {"true": "A specific supplied file or observed check demonstrates the required behavior or content; a plan to add it later does not count.", "false": "The artifact omits, contradicts, or merely claims to meet this requirement."}}},
+    {"id": "composition", "weight": 0.25, "instructions": "Does the implemented artifact organize content into a coherent, readable visual hierarchy appropriate to the brief's platform?",
+      "levels": ["No usable hierarchy or deliverable", "Some grouping but competing emphasis or confusing order", "Clear hierarchy, consistent visual vocabulary and legible content", "Clear hierarchy, distinctive coherent composition, sensible reading order and appropriate density"]},
+    {"id": "navigation", "weight": 0.2, "instructions": "Can the intended visitor understand the purpose, choose relevant content and follow meaningful destinations from the actual files?",
+      "levels": ["Purpose or destinations missing", "Purpose stated but content or links hard to navigate", "Clear introduction and relevant descriptive links", "Clear introduction, prioritized routes, and understandable destination/context for each main link"]},
+    {"id": "implementation", "weight": 0.15, "instructions": "Are the supplied files compatible with the stated platform and usable when images, screen size or theme differ? Judge code and observed checks, not an asserted screenshot review.",
+      "levels": ["Missing files or incompatible core features", "Plausible implementation with an important compatibility/accessibility gap", "Native supported structure, text alternatives and reasonable theme/width behavior", "Native structure, useful accessible fallbacks, deliberate theme/width handling and concrete verification evidence"]},
+    {"id": "truthfulness", "weight": 0.1, "instructions": "Do identity, project descriptions and status claims agree with the supplied source material?",
+      "levels": ["Invented facts or capabilities", "Important claims unsupported or status ambiguous", "Main claims supported and planned work identified", "Specific supported claims, clear limitations, and no invented metrics or credentials"]}
+  ],
+  "vetoes": [
+    {"id": "violates_hard_constraint", "threshold": 0.7,
+      "instructions": "Does an implemented feature or dependency contradict an explicit prohibition in the brief?",
+      "criteria": {"true": "A supplied file requires a forbidden action, dependency or content.", "false": "No supplied feature requires an explicitly forbidden action, dependency or content."}},
+    {"id": "missing_deliverable", "threshold": 0.7,
+      "instructions": "Does the proposal substitute discussion or placeholders for the main artifact requested in the brief?",
+      "criteria": {"true": "The main deliverable is absent, a placeholder, or left as future work.", "false": "The main artifact is present in the supplied files."}}
+  ],
+  "decision": {"min_confidence": 0.5, "min_total": 0.65, "min_margin": 0.05}
+}

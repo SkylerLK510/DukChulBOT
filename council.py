@@ -1,4 +1,4 @@
-"""Design council: several proposals in, one ADVISORY recommendation out.
+"""Ringo design council: several proposals in, one ADVISORY recommendation out.
 
 After Karpathy's llm-council, with one change of shape. There, LLMs answer, LLMs
 rank each other in prose, and a chairman LLM writes the verdict. Here:
@@ -10,7 +10,7 @@ rank each other in prose, and a chairman LLM writes the verdict. Here:
   3. CODE is the chairman: weights, veto thresholds and a confidence gate decide
      between "recommend X" and "escalate to a human", and say why
 
-The default judge is DukChulBOT: an LLM acting as Jev through its own CLI (claude, codex, or any
+The default judge is Ringo: an LLM acting as Jev through its own CLI (claude, codex, or any
 command that reads a prompt on stdin), asked several times per proposal so that
 disagreement between runs gives the probabilities. TypeSafe's paid System One API
 (https://docs.typesafe.ai/api) and a local Ollama model are the other judges. Raw answers
@@ -51,7 +51,7 @@ SCHEMA_VERSION = 3  # 3: provenance, checkpoints, mandatory constraints, the sha
 TYPESAFE_URL = 'https://api.typesafe.ai/v1/systemone'
 DEFAULT_MODEL = 'jev-latest'
 DEFAULT_RUBRIC = Path(__file__).parent / 'rubrics' / 'system_design.json'
-SKILL = Path(__file__).parent / 'skills' / 'dukchulbot' / 'SKILL.md'  # DukChulBOT's instructions
+SKILL = Path(__file__).parent / 'skills' / 'ringo' / 'SKILL.md'  # Ringo's instructions
 # Commands checked to give the plain model with no user settings (the Claude CLI would otherwise
 # load the user's default agent), skills, MCP servers, plugins, web search or saved session. Codex
 # keeps its built-in shell tools, sandboxed read-only in an empty folder.
@@ -452,7 +452,7 @@ class OllamaJudge:
 
 
 def skill_prompt():
-    """DukChulBOT's instructions: skills/dukchulbot/SKILL.md without its front matter."""
+    """Ringo's instructions: skills/ringo/SKILL.md without its front matter."""
     text = SKILL.read_text(encoding='utf-8')
     if text.startswith('---\n'):
         text = text.split('\n---\n', 1)[1]
@@ -507,15 +507,11 @@ def _object(pairs):
     return obj
 
 
-def read_reply(text, keys):
-    """{question id: level or bool} from a judge's reply. The reply must hold exactly one
-    top-level JSON object with exactly the questions' keys, bare or inside prose or a code
-    fence. An object nested in another is never read, and an object that repeats a key does not
-    count, so JSON quoted from a proposal cannot stand in for the answer: a second matching
-    object makes the reply ambiguous. Anything else raises ValueError, and a missing or non-bool
-    veto is never read as false, which would let it pass."""
+def top_level_objects(text):
+    """Every top-level JSON object in text, bare or inside prose or a code fence. An object nested in another is
+    never yielded on its own, and each object records whether it repeats a key (repeats_a_key)."""
     decoder = json.JSONDecoder(parse_constant=_no_constant, parse_float=_finite_float, object_pairs_hook=_object)
-    found, nearest, start = [], None, 0
+    start = 0
     while (start := text.find('{', start)) != -1:
         try:
             obj, end = decoder.raw_decode(text, start)
@@ -523,8 +519,19 @@ def read_reply(text, keys):
             start += 1
             continue
         start = end  # skip the object's inside: a nested object is never the answer
-        if not isinstance(obj, dict):
-            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def read_reply(text, keys):
+    """{question id: level or bool} from a judge's reply. The reply must hold exactly one
+    top-level JSON object with exactly the questions' keys, bare or inside prose or a code
+    fence. An object nested in another is never read, and an object that repeats a key does not
+    count, so JSON quoted from a proposal cannot stand in for the answer: a second matching
+    object makes the reply ambiguous. Anything else raises ValueError, and a missing or non-bool
+    veto is never read as false, which would let it pass."""
+    found, nearest = [], None
+    for obj in top_level_objects(text):
         if set(obj) == set(keys) and not obj.repeats_a_key:
             found.append(obj)
         elif nearest is None or len(set(keys) - set(obj)) < len(set(keys) - set(nearest)):
@@ -553,9 +560,41 @@ def read_reply(text, keys):
     return picks
 
 
+def run_isolated(argv, prompt, timeout_s):
+    """stdout of one run. The working folder is empty, so no project instructions or files
+    load from it; it is not a file-system boundary. The command gets the caller's
+    environment without the TypeSafe key, in a session of its own, so a timeout kills it and
+    everything it started, not only the direct child."""
+    # ceiling: stdout is read whole; a command that floods it fills disk and memory
+    env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
+    # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
+    # started still holds stdout open; whatever it started is then killed with its session.
+    with tempfile.TemporaryDirectory(prefix='council-judge-') as cwd, tempfile.TemporaryFile() as out, \
+            tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=err, cwd=cwd, env=env,
+                                start_new_session=True)
+        try:
+            proc.communicate(prompt.encode('utf-8'), timeout=timeout_s)
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL) if hasattr(os, 'killpg') else proc.kill()
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+        out.seek(0)
+        err.seek(0)
+        stdout, stderr = out.read().decode('utf-8', 'replace'), err.read().decode('utf-8', 'replace')
+    if proc.returncode:
+        tail = ' '.join(stderr.split())[-300:]
+        exc = JudgeError(f'{Path(argv[0]).name} exited with {proc.returncode}' + (f': {tail}' if tail else ''))
+        exc.stdout = stdout  # a CLI can report on stdout what the failed call cost
+        raise exc
+    return stdout
+
+
 class CommandJudge:
-    """An LLM acting as Jev through its own command-line tool, with no API bill. Each sample runs
-    one command (round robin over several) with skills/dukchulbot/SKILL.md, the questions and the input
+    """An LLM acting as Jev through its own command-line tool. Backend usage may be billed. Each sample runs
+    one command (round robin over several) with skills/ringo/SKILL.md, the questions and the input
     on stdin, in an empty folder, and reads one pick per question from the reply. Disagreement
     between samples is the uncertainty: a level's probability is the share of samples that chose
     it, a Noul's the share that said true, each shrunk by one pseudo-sample toward an even split.
@@ -563,11 +602,11 @@ class CommandJudge:
     better than a confidence the model states (Jung et al., ICLR 2025: AUROC 0.72 against 0.55),
     but it is not calibrated either. One sample has no distribution, so its answers carry
     confidence None, as the Ollama judge's do."""
-    name = 'dukchulbot'
+    name = 'ringo'
 
     def __init__(self, commands, samples=6, timeout_s=600.0, max_attempts=2, runner=None):
         if not commands:
-            raise JudgeError(f"DukChulBOT needs --judge-cmd: a preset ({', '.join(JUDGE_PRESETS)}) "
+            raise JudgeError(f"Ringo needs --judge-cmd: a preset ({', '.join(JUDGE_PRESETS)}) "
                              'or a full command that reads a prompt on stdin')
         if type(samples) is not int or not 1 <= samples <= 25 or type(max_attempts) is not int or max_attempts < 1 \
                 or not is_number(timeout_s) or timeout_s <= 0:
@@ -582,33 +621,8 @@ class CommandJudge:
                      'max_attempts': max_attempts, 'skill_sha256': sha256(SKILL.read_bytes())}
 
     def run_command(self, argv, prompt):
-        """stdout of one run. The working folder is empty, so no project instructions or files
-        load from it; it is not a file-system boundary. The command gets the caller's
-        environment without the TypeSafe key, in a session of its own, so a timeout kills it and
-        everything it started, not only the direct child."""
-        # ceiling: stdout is read whole; a command that floods it fills disk and memory
-        env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
-        # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
-        # started still holds stdout open; whatever it started is then killed with its session.
-        with tempfile.TemporaryDirectory(prefix='council-judge-') as cwd, tempfile.TemporaryFile() as out, \
-                tempfile.TemporaryFile() as err:
-            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=err, cwd=cwd, env=env,
-                                    start_new_session=True)
-            try:
-                proc.communicate(prompt.encode('utf-8'), timeout=self.timeout_s)
-            finally:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL) if hasattr(os, 'killpg') else proc.kill()
-                except (ProcessLookupError, PermissionError):
-                    pass
-                proc.wait()
-            out.seek(0)
-            err.seek(0)
-            stdout, stderr = out.read().decode('utf-8', 'replace'), err.read().decode('utf-8', 'replace')
-        if proc.returncode:
-            tail = ' '.join(stderr.split())[-300:]
-            raise JudgeError(f'{Path(argv[0]).name} exited with {proc.returncode}' + (f': {tail}' if tail else ''))
-        return stdout
+        """stdout of one run of argv with prompt on stdin, isolated as run_isolated describes."""
+        return run_isolated(argv, prompt, self.timeout_s)
 
     def sample(self, k, prompt, keys):
         """Sample k's picks and the attempts it took. A failed or unreadable reply is asked again;
@@ -1245,8 +1259,8 @@ def parse_args(argv):
             p.add_argument('--seed', type=int, default=0)
             p.add_argument('--typesafe-model', default=DEFAULT_MODEL,
                            help='alias or version; pin a version such as jev-1.13.0 once thresholds are tuned')
-            p.add_argument('--judge', choices=('dukchulbot', 'typesafe', 'ollama'), default='dukchulbot',
-                           help='dukchulbot (default): DukChulBOT, an LLM through its CLI, no API bill; typesafe: the paid Jev API')
+            p.add_argument('--judge', choices=('ringo', 'dukchulbot', 'typesafe', 'ollama'), default='ringo',
+                           help='ringo (default): an LLM through its CLI; dukchulbot: legacy alias; typesafe: the paid Jev API')
         if name == 'show-request':
             continue
         if name == 'judge':
@@ -1254,7 +1268,7 @@ def parse_args(argv):
                            help=f"a preset ({', '.join(JUDGE_PRESETS)}) or a command that reads the prompt on stdin; "
                                 'repeat it for a panel, sampled in turn')
             p.add_argument('--samples', type=int, default=6,
-                           help='runs per proposal for DukChulBOT (default 6: even, so a 2-command panel splits evenly)')
+                           help='runs per proposal for Ringo (default 6: even, so a 2-command panel splits evenly)')
             p.add_argument('--ollama-url', default='http://localhost:11434')
             p.add_argument('--ollama-model', default='qwen2.5:7b')
         p.add_argument('--out', help='write the full JSON report here (judge: also after each proposal)')
@@ -1274,6 +1288,8 @@ def parse_args(argv):
     p = sub.add_parser('validate', help='risk and coverage of the operative and shadow gates on labelled decisions')
     p.add_argument('--journal', required=True)
     args = parser.parse_args(argv)
+    if getattr(args, 'judge', None) == 'dukchulbot':
+        args.judge = 'ringo'
     if getattr(args, 'journal', None) and args.command in ('judge', 'rescore') and not args.out:
         parser.error('--journal needs --out, so the journal can point at a saved report')
     return parser, args
@@ -1331,7 +1347,7 @@ def run(parser, args, out):
     if args.command == 'show-request':
         for item in anonymised:
             print(f"# {item['label']}  <- {item['source']}", file=out)
-            if args.judge == 'dukchulbot':  # the first sample's prompt; later samples reorder questions and levels
+            if args.judge == 'ringo':  # the first sample's prompt; later samples reorder questions and levels
                 print(judge_prompt(brief, item['text'], build_questions(rubric, constraints), 0)[0], file=out)
             else:
                 print(json.dumps(build_request(brief, item['text'], rubric, args.typesafe_model), indent=2), file=out)
